@@ -1,0 +1,41 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+streamlit_cache/
+*.streamlit.io
+
+# Data & Temp
+sample_data/
+temp/
+tmp/
+*.xlsx
+*.csv
+!sample_data/*.csv
+
+# Logs
+*.log

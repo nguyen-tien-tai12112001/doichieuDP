@@ -1,9 +1,9 @@
-"""
-Validators module for file and data validation.
-"""
+"""Validators module for file and data validation."""
+
 import os
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 
 
@@ -115,7 +115,7 @@ def validate_branch_codes_match(t1_files: List[str], t2_files: List[str]) -> Dic
     return branch_dates
 
 
-def validate_csv_headers(filepath: str) -> None:
+def validate_csv_headers(filepath: str, column_mapping: Optional[Dict[str, str]] = None) -> None:
     """
     Validate that CSV has all required columns.
     
@@ -127,7 +127,9 @@ def validate_csv_headers(filepath: str) -> None:
     """
     try:
         df = pd.read_csv(filepath, nrows=0)
-        missing_cols = set(REQUIRED_COLUMNS) - set(df.columns)
+        mapping = column_mapping or {col: col for col in REQUIRED_COLUMNS}
+        expected_source_cols = {mapping.get(col, col) for col in REQUIRED_COLUMNS}
+        missing_cols = expected_source_cols - set(df.columns)
         
         if missing_cols:
             raise ValidationError(
@@ -140,7 +142,11 @@ def validate_csv_headers(filepath: str) -> None:
         raise ValidationError(f"Lỗi validating file '{os.path.basename(filepath)}': {str(e)}")
 
 
-def validate_all_files(t1_files: List[str], t2_files: List[str]) -> Dict[str, str]:
+def validate_all_files(
+    t1_files: List[str],
+    t2_files: List[str],
+    column_mapping: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
     """
     Run all validations on uploaded files.
     
@@ -167,7 +173,7 @@ def validate_all_files(t1_files: List[str], t2_files: List[str]) -> Dict[str, st
     
     # Validate CSV headers
     for filepath in t1_files + t2_files:
-        validate_csv_headers(filepath)
+        validate_csv_headers(filepath, column_mapping=column_mapping)
     
     return {
         "t1_date": t1_date,

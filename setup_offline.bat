@@ -6,11 +6,11 @@ REM ========================================
 
 echo.
 echo ╔════════════════════════════════════════════════════╗
-echo ║   CÀI ĐẶT OFFLINE - HỆ THỐNG SO SÁNH TIỀN GỬI     ║
+echo ║   CÀI ĐẶT OFFLINE - HỆ THỐNG SO SÁNH TIỀN GỬI      ║
 echo ╚════════════════════════════════════════════════════╝
 echo.
 
-REM Kiểm tra Python
+REM Kiểm tra Python 
 python --version >nul 2>&1
 if errorlevel 1 (
     echo ❌ Lỗi: Python không được cài đặt!

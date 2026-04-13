@@ -1,12 +1,44 @@
-"""
-Data loader module for reading and normalizing CSV files.
-"""
+"""Data loader module for reading and normalizing CSV files."""
+
 import os
-from typing import Dict, List
+from typing import Dict, Optional
+
 import pandas as pd
 
 
-def load_and_normalize_csv(filepath: str) -> pd.DataFrame:
+CANONICAL_COLUMNS = ['MA_KH', 'TEN_KH', 'DP_TYPE_CODE', 'CURRENT_BALANCE', 'CUST_TYPE_NAME']
+LARGE_FILE_THRESHOLD_BYTES = 10 * 1024 * 1024
+DEFAULT_CHUNK_SIZE = 200_000
+
+
+def _build_rename_map(column_mapping: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Build source->canonical rename map from canonical->source mapping."""
+    mapping = column_mapping or {col: col for col in CANONICAL_COLUMNS}
+    rename_map = {}
+
+    for canonical in CANONICAL_COLUMNS:
+        source = mapping.get(canonical, canonical)
+        if source != canonical:
+            rename_map[source] = canonical
+
+    return rename_map
+
+
+def _read_csv_safely(filepath: str) -> pd.DataFrame:
+    """Read CSV in normal mode or chunked mode for large files."""
+    file_size = os.path.getsize(filepath)
+
+    if file_size < LARGE_FILE_THRESHOLD_BYTES:
+        return pd.read_csv(filepath)
+
+    chunks = []
+    for chunk in pd.read_csv(filepath, chunksize=DEFAULT_CHUNK_SIZE):
+        chunks.append(chunk)
+
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+
+
+def load_and_normalize_csv(filepath: str, column_mapping: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     """
     Load CSV and normalize data types.
     
@@ -16,7 +48,11 @@ def load_and_normalize_csv(filepath: str) -> pd.DataFrame:
     Returns:
         DataFrame with normalized columns
     """
-    df = pd.read_csv(filepath)
+    df = _read_csv_safely(filepath)
+
+    rename_map = _build_rename_map(column_mapping)
+    if rename_map:
+        df = df.rename(columns=rename_map)
     
     # Normalize data types
     df['MA_KH'] = df['MA_KH'].astype(str).str.strip()
@@ -28,7 +64,12 @@ def load_and_normalize_csv(filepath: str) -> pd.DataFrame:
     return df
 
 
-def load_branch_data(ma_cn: str, t1_file: str, t2_file: str) -> Dict[str, pd.DataFrame]:
+def load_branch_data(
+    ma_cn: str,
+    t1_file: str,
+    t2_file: str,
+    column_mapping: Optional[Dict[str, str]] = None,
+) -> Dict[str, pd.DataFrame]:
     """
     Load data for a specific branch from T1 and T2 files.
     
@@ -41,8 +82,8 @@ def load_branch_data(ma_cn: str, t1_file: str, t2_file: str) -> Dict[str, pd.Dat
         Dict with 'T1' and 'T2' DataFrames
     """
     # Load both files
-    df_t1 = load_and_normalize_csv(t1_file)
-    df_t2 = load_and_normalize_csv(t2_file)
+    df_t1 = load_and_normalize_csv(t1_file, column_mapping=column_mapping)
+    df_t2 = load_and_normalize_csv(t2_file, column_mapping=column_mapping)
     
     # Add metadata
     df_t1['_branch'] = ma_cn
@@ -67,7 +108,10 @@ def filter_valid_data(df: pd.DataFrame) -> pd.DataFrame:
     return df[~df['DP_TYPE_CODE'].isin(exclude_types)].copy()
 
 
-def load_all_branches(file_mapping: Dict[str, tuple]) -> Dict[str, Dict[str, pd.DataFrame]]:
+def load_all_branches(
+    file_mapping: Dict[str, tuple],
+    column_mapping: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, pd.DataFrame]]:
     """
     Load data for all branches.
     
@@ -80,6 +124,6 @@ def load_all_branches(file_mapping: Dict[str, tuple]) -> Dict[str, Dict[str, pd.
     result = {}
     
     for ma_cn, (t1_file, t2_file) in file_mapping.items():
-        result[ma_cn] = load_branch_data(ma_cn, t1_file, t2_file)
+        result[ma_cn] = load_branch_data(ma_cn, t1_file, t2_file, column_mapping=column_mapping)
     
     return result

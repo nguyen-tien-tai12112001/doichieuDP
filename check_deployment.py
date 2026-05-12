@@ -129,10 +129,30 @@ class DeploymentChecker:
         max_size_mb = 100
         large_files = []
         
+        # Read .gitignore to exclude ignored files
+        gitignore_patterns = []
+        gitignore_path = self.root / '.gitignore'
+        if gitignore_path.exists():
+            with open(gitignore_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        gitignore_patterns.append(line)
+        
+        def is_ignored(filepath):
+            """Check if file matches any gitignore pattern."""
+            relative_path = str(filepath.relative_to(self.root))
+            for pattern in gitignore_patterns:
+                # Simple pattern matching (could be improved with fnmatch)
+                if pattern in relative_path or relative_path.startswith(pattern.rstrip('/')):
+                    return True
+            return False
+        
         for file_path in self.root.rglob('*'):
             if file_path.is_file() and file_path.stat().st_size > max_size_mb * 1024 * 1024:
-                size_mb = file_path.stat().st_size / (1024 * 1024)
-                large_files.append((file_path.relative_to(self.root), size_mb))
+                if not is_ignored(file_path):
+                    size_mb = file_path.stat().st_size / (1024 * 1024)
+                    large_files.append((file_path.relative_to(self.root), size_mb))
         
         if large_files:
             for file, size in large_files:

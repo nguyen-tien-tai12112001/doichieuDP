@@ -1,0 +1,5 @@
+# System dependencies for Streamlit Cloud
+# Uncomment if needed for specific packages
+# libgomp1
+# build-essential
+# python3-dev

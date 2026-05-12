@@ -60,6 +60,10 @@ def export_to_excel(
     driver_analysis_df: pd.DataFrame = None,
     segment_summary_df: pd.DataFrame = None,
     alert_summary_df: pd.DataFrame = None,
+    prediction_df: pd.DataFrame = None,
+    market_context: list[str] = None,
+    capital_strategy: list[dict] = None,
+    ai_insights: list[str] = None,
     filename: str = None
 ) -> bytes:
     """
@@ -76,6 +80,10 @@ def export_to_excel(
         driver_analysis_df: Driver analysis data (optional)
         segment_summary_df: Segment summary data (optional)
         alert_summary_df: Alert summary data (optional)
+        prediction_df: Forecast data (optional)
+        market_context: Market context narrative (optional)
+        capital_strategy: List of strategy guidance (optional)
+        ai_insights: AI insight list (optional)
         filename: Output filename (optional)
 
     Returns:
@@ -88,6 +96,18 @@ def export_to_excel(
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF")
     
+    def _write_text_sheet(sheet_name: str, rows: list[str]):
+        if not rows:
+            return
+        df_export = pd.DataFrame({'Nội dung': rows})
+        df_export.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        for col_num in range(1, len(df_export.columns) + 1):
+            ws.column_dimensions[get_column_letter(col_num)].width = 100
+
     with pd.ExcelWriter(writer_path, engine='openpyxl') as writer:
         # Sheet 1: Detailed customers
         if not comparison_df.empty:
@@ -111,7 +131,38 @@ def export_to_excel(
                 col_letter = get_column_letter(col_num)
                 ws.column_dimensions[col_letter].width = 15
         
-        # Sheet 2: Summary by branch
+        # Sheet 2: Executive Summary
+        executive_summary = []
+        if not comparison_df.empty:
+            total_customers = len(comparison_df)
+            total_t1 = float(comparison_df['TOTAL_T1'].sum())
+            total_t2 = float(comparison_df['TOTAL_T2'].sum())
+            total_delta = float(comparison_df['DELTA'].sum())
+            executive_summary.extend([
+                f'Tổng khách hàng so sánh: {total_customers}',
+                f'Tổng T1: {total_t1:,.0f}',
+                f'Tổng T2: {total_t2:,.0f}',
+                f'Tổng DELTA: {total_delta:,.0f}',
+                f'Tỉ lệ tăng trưởng tổng: {((total_delta / max(abs(total_t1), 1)) * 100):.2f}%'
+            ])
+        if market_context:
+            executive_summary.append('---')
+            executive_summary.append('Bối cảnh thị trường:')
+            executive_summary.extend(market_context)
+        if capital_strategy:
+            executive_summary.append('---')
+            executive_summary.append('Chiến lược huy động vốn:')
+            for strategy in capital_strategy:
+                executive_summary.append(f"{strategy['title']}: {strategy['description']}")
+        if ai_insights:
+            executive_summary.append('---')
+            executive_summary.append('AI insights tổng hợp:')
+            executive_summary.extend(ai_insights)
+
+        if executive_summary:
+            _write_text_sheet('Executive Summary', executive_summary)
+
+        # Sheet 3: Summary by branch
         if not summary_branch.empty:
             df_export = summary_branch.copy()
             for col in ['TONG_T1', 'TONG_T2', 'TONG_DELTA']:
@@ -196,6 +247,32 @@ def export_to_excel(
             df_export.to_excel(writer, sheet_name='Khuyến Nghị', index=False)
 
             ws = writer.sheets['Khuyến Nghị']
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            for col_num in range(1, len(df_export.columns) + 1):
+                ws.column_dimensions[get_column_letter(col_num)].width = 18
+
+        # Sheet 7: Market context
+        if market_context:
+            _write_text_sheet('Market Context', market_context)
+
+        # Sheet 8: Capital strategy
+        if capital_strategy:
+            strategy_lines = []
+            for item in capital_strategy:
+                strategy_lines.append(f"{item['title']} - {item['description']}")
+            _write_text_sheet('Capital Strategy', strategy_lines)
+
+        # Sheet 9: AI Insights
+        if ai_insights:
+            _write_text_sheet('AI Insights', ai_insights)
+
+        # Sheet 10: Forecast
+        if prediction_df is not None and not prediction_df.empty:
+            df_export = prediction_df.copy()
+            df_export.to_excel(writer, sheet_name='Dự Báo', index=False)
+            ws = writer.sheets['Dự Báo']
             for cell in ws[1]:
                 cell.fill = header_fill
                 cell.font = header_font

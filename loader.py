@@ -7,7 +7,7 @@ import pandas as pd
 
 
 CANONICAL_COLUMNS = ['MA_KH', 'TEN_KH', 'DP_TYPE_CODE', 'CURRENT_BALANCE', 'CUST_TYPE_NAME']
-LARGE_FILE_THRESHOLD_BYTES = 10 * 1024 * 1024
+LARGE_FILE_THRESHOLD_BYTES = 20 * 1024 * 1024  # 20MB threshold for chunked reading
 DEFAULT_CHUNK_SIZE = 200_000
 
 
@@ -30,12 +30,12 @@ def _read_csv_safely(filepath: str) -> pd.DataFrame:
 
     if file_size < LARGE_FILE_THRESHOLD_BYTES:
         return pd.read_csv(filepath)
-
-    chunks = []
-    for chunk in pd.read_csv(filepath, chunksize=DEFAULT_CHUNK_SIZE):
-        chunks.append(chunk)
-
-    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    else:
+        # For large files, use chunked reading
+        chunks = []
+        for chunk in pd.read_csv(filepath, chunksize=DEFAULT_CHUNK_SIZE):
+            chunks.append(chunk)
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
 def load_and_normalize_csv(filepath: str, column_mapping: Optional[Dict[str, str]] = None) -> pd.DataFrame:
@@ -60,7 +60,7 @@ def load_and_normalize_csv(filepath: str, column_mapping: Optional[Dict[str, str
     df['DP_TYPE_CODE'] = df['DP_TYPE_CODE'].astype(str).str.strip()
     df['CURRENT_BALANCE'] = pd.to_numeric(df['CURRENT_BALANCE'], errors='coerce').fillna(0)
     df['CUST_TYPE_NAME'] = df['CUST_TYPE_NAME'].astype(str).str.strip()
-    
+        
     return df
 
 

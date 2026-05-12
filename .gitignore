@@ -34,8 +34,20 @@ sample_data/
 temp/
 tmp/
 *.xlsx
-*.csv
-!sample_data/*.csv
+data_warehouse/*.csv
+!data_warehouse/.gitkeep
+
+# Database files (too large for GitHub)
+*.db
+*.sqlite
+*.sqlite3
+app_database.db
+comparison_history.csv
 
 # Logs
 *.log
+
+# Cache
+.cache/
+*.pickle
+processed_cache/

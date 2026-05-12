@@ -1,0 +1,2 @@
+# This file ensures the data_warehouse directory exists in the repository
+# CSV files are not tracked (see .gitignore)

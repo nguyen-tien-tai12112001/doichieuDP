@@ -10,11 +10,17 @@ from pathlib import Path
 import os
 import io
 import json
+import re
 from datetime import datetime
 import tempfile
-from typing import Dict, List, Tuple
+import shutil
+from typing import Dict, List, Tuple, Optional
 import pickle
 import sqlite3
+try:
+    import pymysql
+except ImportError:
+    pymysql = None
 from contextlib import contextmanager
 
 # Import custom modules
@@ -28,9 +34,29 @@ from summary_engine import (
 )
 from outlier_engine import detect_outliers_iqr, get_outliers_summary, analyze_outliers
 from exporter import export_to_excel
+from interest_rate_fetcher import get_interest_rate_insights
+from ai_insights import (
+    perform_customer_segmentation,
+    predict_churn_risk,
+    generate_ai_recommendations
+)
+from sharing import render_sharing_interface, render_shared_analysis_viewer
+from data_warehouse import (
+    init_warehouse_tables, import_file_to_warehouse, import_files_batch,
+    list_warehouse_files, delete_warehouse_file, delete_warehouse_files_batch,
+    get_warehouse_stats, get_file_path, get_file_info, get_warehouse_files_by_branch,
+    suggest_file_pairs
+)
+from warehouse_ui import (
+    build_comparison_from_warehouse,
+    render_calendar_view,
+    render_enhanced_file_list,
+    render_import_section,
+    render_statistics_section,
+)
+from auth_manager import log_audit
 
 
-CANONICAL_COLUMNS = ['MA_KH', 'TEN_KH', 'DP_TYPE_CODE', 'CURRENT_BALANCE', 'CUST_TYPE_NAME']
 DATABASE_FILE = Path('app_database.db')
 
 SEGMENT_BUCKETS = [
@@ -54,6 +80,11 @@ def get_db_connection():
         yield conn
     finally:
         conn.close()
+
+
+def filter_files_by_branch_access(df: pd.DataFrame) -> pd.DataFrame:
+    """Return all warehouse files without branch access filtering."""
+    return df
 
 
 def init_database():
@@ -106,6 +137,9 @@ def init_database():
         ''')
 
         conn.commit()
+
+    # Initialize warehouse tables
+    init_warehouse_tables()
 
 
 def save_history_to_db(entry: Dict[str, str]) -> None:
@@ -224,11 +258,14 @@ def load_processed_data_from_db(cache_key: str) -> Dict:
 
                 # Try pickle first (new format)
                 try:
-                    return pickle.loads(data)
+                    loaded_data = pickle.loads(data)
+                    # Ensure it's a dict
+                    return loaded_data if isinstance(loaded_data, dict) else {}
                 except (TypeError, pickle.UnpicklingError):
                     # Fall back to JSON (old format) - but this will return strings, not DataFrames
                     # So we'll return empty dict to force re-processing
-                    st.info("Cache cũ không tương thích, sẽ tạo cache mới.")
+                    placeholder = st.container(key='info_cache_format')
+                    placeholder.info("Cache cũ không tương thích, sẽ tạo cache mới.")
                     return {}
     except Exception as e:
         st.warning(f"Không thể tải cache từ database: {e}")
@@ -249,7 +286,8 @@ def cleanup_old_cache(days: int = 30) -> None:
             conn.commit()
 
             if deleted_count > 0:
-                st.info(f"Đã dọn dẹp {deleted_count} cache entries cũ")
+                placeholder = st.container(key='info_cache_cleanup')
+                placeholder.info(f"Đã dọn dẹp {deleted_count} cache entries cũ")
     except Exception as e:
         st.warning(f"Lỗi khi dọn dẹp cache: {e}")
 
@@ -335,6 +373,56 @@ st.markdown("""
         font-size: 16px;
         font-weight: 600;
     }
+    [data-testid="stSidebar"] {
+        background: #f8fafc;
+        border-right: 1px solid #e5e7eb;
+    }
+    [data-testid="stSidebar"] .stButton>button {
+        justify-content: flex-start;
+        border-radius: 8px;
+        min-height: 42px;
+        font-weight: 600;
+        border: 1px solid #e5e7eb;
+    }
+    [data-testid="stSidebar"] .stButton>button[kind="primary"] {
+        background: #0f766e;
+        border-color: #0f766e;
+        color: white;
+    }
+    .sidebar-brand {
+        padding: 10px 4px 18px 4px;
+        margin-bottom: 8px;
+        border-bottom: 1px solid #e5e7eb;
+    }
+    .sidebar-brand-title {
+        color: #0f172a;
+        font-size: 1.35rem;
+        font-weight: 800;
+        line-height: 1.1;
+    }
+    .sidebar-brand-subtitle {
+        color: #64748b;
+        font-size: 0.85rem;
+        margin-top: 4px;
+    }
+    @media (max-width: 900px) {
+        .main-header {
+            font-size: 2rem;
+        }
+        .sub-header {
+            font-size: 0.95rem;
+        }
+        .metric-card, .step-guide, .info-box, .success-box, .warning-box {
+            padding: 14px;
+        }
+        .stButton>button, .stDownloadButton>button {
+            width: 100% !important;
+            min-width: unset !important;
+        }
+        .css-1d391kg, .css-1ydfahe {
+            padding: 8px !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -342,9 +430,10 @@ def init_session_state() -> None:
     """Initialize session state keys used by the app."""
     defaults = {
         'processed_data': None,
-        'validation_result': None,
-        'upload_context': None,
+        'history_loaded_data': None,
         'processing_cache': {},
+        'selected_t1_files': [],
+        'selected_t2_files': [],
     }
 
     for key, value in defaults.items():
@@ -352,39 +441,15 @@ def init_session_state() -> None:
             st.session_state[key] = value
 
 
-def get_current_column_mapping() -> Dict[str, str]:
-    """Read current mapping values from widget state."""
-    mapping = {}
-    for canonical in CANONICAL_COLUMNS:
-        key = f'map_{canonical}'
-        if key not in st.session_state:
-            st.session_state[key] = canonical
-        mapping[canonical] = st.session_state[key].strip() or canonical
-    return mapping
-
-
-def generate_template_csv(column_mapping: Dict[str, str]) -> bytes:
-    """Generate downloadable CSV template using current column mapping."""
-    sample_df = pd.DataFrame([
-        {
-            'MA_KH': 'CUST001',
-            'TEN_KH': 'NGUYEN VAN A',
-            'DP_TYPE_CODE': '010',
-            'CURRENT_BALANCE': 150000000,
-            'CUST_TYPE_NAME': 'CA_NHAN',
-        },
-        {
-            'MA_KH': 'CUST002',
-            'TEN_KH': 'CONG TY ABC',
-            'DP_TYPE_CODE': '020',
-            'CURRENT_BALANCE': 520000000,
-            'CUST_TYPE_NAME': 'PHAP_NHAN',
-        },
-    ])
-
-    rename_map = {canonical: column_mapping.get(canonical, canonical) for canonical in CANONICAL_COLUMNS}
-    sample_df = sample_df.rename(columns=rename_map)
-    return sample_df.to_csv(index=False).encode('utf-8-sig')
+def get_active_analysis_data() -> Optional[Dict]:
+    """Return the currently active analysis payload for the app."""
+    if st.session_state.get('history_loaded_data') is not None:
+        data = st.session_state['history_loaded_data']
+        # Ensure it's a dict, not a DataFrame
+        return data if isinstance(data, dict) else None
+    data = st.session_state.get('processed_data')
+    # Ensure it's a dict, not a DataFrame
+    return data if isinstance(data, dict) else None
 
 
 def save_uploaded_files(files, temp_dir: str) -> List[str]:
@@ -398,6 +463,17 @@ def save_uploaded_files(files, temp_dir: str) -> List[str]:
     return paths
 
 
+def cleanup_temp_dir(temp_dir: str) -> None:
+    """Remove temporary directory if it still exists."""
+    if not temp_dir:
+        return
+    try:
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
+    except Exception as e:
+        st.warning(f"Không thể xóa thư mục tạm: {e}")
+
+
 def collect_file_metadata(files) -> List[Dict[str, str]]:
     """Collect filename and content hash for cache/history."""
     metadata = []
@@ -406,21 +482,6 @@ def collect_file_metadata(files) -> List[Dict[str, str]]:
         digest = hashlib.sha256(raw).hexdigest()
         metadata.append({'name': file.name, 'sha256': digest})
     return sorted(metadata, key=lambda x: x['name'])
-
-
-def build_cache_key(
-    t1_meta: List[Dict[str, str]],
-    t2_meta: List[Dict[str, str]],
-    column_mapping: Dict[str, str],
-) -> str:
-    """Build a deterministic cache key from inputs and mapping."""
-    payload = {
-        't1': t1_meta,
-        't2': t2_meta,
-        'column_mapping': column_mapping,
-    }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
 def append_history(entry: Dict[str, str]) -> None:
@@ -443,21 +504,116 @@ def load_history(limit: int = 20) -> pd.DataFrame:
     return load_history_from_db(limit)
 
 
-def render_friendly_error(error_text: str) -> None:
-    """Display user-friendly validation errors with suggestions."""
-    st.error(f"❌ {error_text}")
-    st.markdown(
-        """
-        <div class="warning-box">
-            <b>Gợi ý xử lý nhanh:</b><br>
-            1) Kiểm tra tên file có dạng <code>{MA_CN}_dp01_yyyymmdd.csv</code><br>
-            2) Tải template CSV mẫu để đối chiếu cấu trúc cột<br>
-            3) Nếu cột nguồn khác tên chuẩn, chỉnh lại ở mục <b>Mapping Cột</b><br>
-            4) Re-run bước 2: Kiểm tra dữ liệu
-        </div>
-        """,
-        unsafe_allow_html=True,
+def sanitize_sql_name(name: str) -> str:
+    safe_name = re.sub(r'\s+', '_', str(name).strip())
+    safe_name = re.sub(r'[^0-9a-zA-Z_]', '_', safe_name)
+    if not safe_name:
+        safe_name = 'column'
+    if safe_name[0].isdigit():
+        safe_name = 'c_' + safe_name
+    return safe_name[:64]
+
+
+def parse_filename_date(filename: str) -> Optional[str]:
+    """Extract date string from filename if it follows the expected pattern."""
+    match = re.match(r'^(\d{4})_dp01_(\d{8})\.csv$', filename)
+    return match.group(2) if match else None
+
+
+def build_mariadb_table_schema(df: pd.DataFrame) -> str:
+    cols = []
+    for col in df.columns:
+        colname = sanitize_sql_name(col)
+        dtype = df[col].dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            sql_type = 'BIGINT'
+        elif pd.api.types.is_float_dtype(dtype):
+            sql_type = 'DOUBLE'
+        elif pd.api.types.is_bool_dtype(dtype):
+            sql_type = 'TINYINT'
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            sql_type = 'DATETIME'
+        else:
+            sql_type = 'TEXT'
+        cols.append(f'`{colname}` {sql_type}')
+    return ', '.join(cols)
+
+
+def get_mariadb_connection(host: str, port: int, user: str, password: str, database: str):
+    if pymysql is None:
+        raise ImportError("Chưa cài pymysql. Cài thêm gói pymysql để dùng tính năng ghi MariaDB.")
+    return pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
     )
+
+
+def create_mariadb_table(cursor, table_name: str, df: pd.DataFrame) -> None:
+    safe_table = sanitize_sql_name(table_name)
+    schema = build_mariadb_table_schema(df)
+    create_sql = f"CREATE TABLE IF NOT EXISTS `{safe_table}` (id BIGINT AUTO_INCREMENT PRIMARY KEY, {schema})"
+    cursor.execute(create_sql)
+
+
+def write_dataframe_to_mariadb(cursor, table_name: str, df: pd.DataFrame, overwrite: bool = False) -> int:
+    safe_table = sanitize_sql_name(table_name)
+    if overwrite:
+        cursor.execute(f"TRUNCATE TABLE `{safe_table}`")
+
+    columns = [sanitize_sql_name(col) for col in df.columns]
+    placeholders = ','.join(['%s'] * len(columns))
+    col_list = ','.join([f'`{col}`' for col in columns])
+    insert_sql = f"INSERT INTO `{safe_table}` ({col_list}) VALUES ({placeholders})"
+
+    rows = []
+    for _, row in df.iterrows():
+        values = [None if pd.isna(row[col]) else row[col] for col in df.columns]
+        rows.append(values)
+
+    if rows:
+        cursor.executemany(insert_sql, rows)
+    return len(rows)
+
+
+def save_processed_data_to_mariadb(data: Dict, conn_info: Dict[str, any], table_prefix: str = 'deposit_', overwrite: bool = False) -> Dict[str, int]:
+    stats = {}
+    with get_mariadb_connection(
+        host=conn_info['host'],
+        port=conn_info['port'],
+        user=conn_info['user'],
+        password=conn_info['password'],
+        database=conn_info['database'],
+    ) as conn:
+        cursor = conn.cursor()
+        for key, df in [
+            ('comparison', data.get('comparison', pd.DataFrame())),
+            ('summary_branch', data.get('summary_branch', pd.DataFrame())),
+            ('summary_cust_type', data.get('summary_cust_type', pd.DataFrame())),
+            ('summary_product', data.get('summary_product', pd.DataFrame())),
+            ('segment_summary', data.get('segment_summary', pd.DataFrame())),
+            ('alert_summary', data.get('alert_summary', pd.DataFrame())),
+            ('recommendations', data.get('recommendations', pd.DataFrame())),
+            ('driver_analysis', data.get('driver_analysis', pd.DataFrame())),
+            ('prediction', data.get('prediction', pd.DataFrame())),
+        ]:
+            if df is not None and not df.empty:
+                table_name = f"{table_prefix}{sanitize_sql_name(key)}"
+                create_mariadb_table(cursor, table_name, df)
+                inserted = write_dataframe_to_mariadb(cursor, table_name, df, overwrite=overwrite)
+                stats[table_name] = inserted
+        conn.commit()
+    return stats
+
+
+def render_friendly_error(error_text: str) -> None:
+    """Display user-friendly validation errors."""
+    st.error(f"❌ {error_text}")
 
 
 def _safe_quantile(series: pd.Series, q: float, default_value: float) -> float:
@@ -558,12 +714,13 @@ def build_action_recommendations(comparison_df: pd.DataFrame) -> tuple[pd.DataFr
         }
 
     recommendations_df = pd.DataFrame(rows)
-    priority_order = {'RAT_CAO': 0, 'CAO': 1, 'TRUNG_BINH': 2}
-    recommendations_df['priority_rank'] = recommendations_df['MUC_UU_TIEN'].map(priority_order).fillna(9)
-    recommendations_df = recommendations_df.sort_values(
-        ['priority_rank', 'ABS_DELTA'],
-        ascending=[True, False],
-    ).drop(columns=['priority_rank']).reset_index(drop=True)
+    if not recommendations_df.empty and 'MUC_UU_TIEN' in recommendations_df.columns:
+        priority_order = {'RAT_CAO': 0, 'CAO': 1, 'TRUNG_BINH': 2}
+        recommendations_df['priority_rank'] = recommendations_df['MUC_UU_TIEN'].map(priority_order).fillna(9)
+        recommendations_df = recommendations_df.sort_values(
+            ['priority_rank', 'ABS_DELTA'],
+            ascending=[True, False],
+        ).drop(columns=['priority_rank']).reset_index(drop=True)
 
     return recommendations_df, {
         'risk_threshold': risk_threshold,
@@ -680,7 +837,7 @@ def build_alert_summary(
             'DIEN_GIAI': f"Có {len(outliers_df)} khách hàng bị phát hiện bất thường theo IQR.",
         })
 
-    if not recommendations_df.empty:
+    if not recommendations_df.empty and 'MUC_UU_TIEN' in recommendations_df.columns:
         high_risk = len(recommendations_df[recommendations_df['MUC_UU_TIEN'] == 'RAT_CAO'])
         if high_risk > 0:
             rows.append({
@@ -809,391 +966,966 @@ def build_driver_table(summary_df: pd.DataFrame, group_col: str, analysis_group:
     ]].sort_values('ABS_DELTA', ascending=False).reset_index(drop=True)
 
 
-def main():
-    """Main application function."""
-    init_session_state()
+def build_predictive_forecast(summary_branch: pd.DataFrame) -> pd.DataFrame:
+    """Build a practical forecast using two-period momentum and scenario envelopes."""
+    if summary_branch.empty or not {'TONG_T1', 'TONG_T2'}.issubset(summary_branch.columns):
+        return pd.DataFrame()
 
-    # Header
-    st.markdown('<div class="main-header">📊 Hệ Thống So Sánh Dữ Liệu Tiền Gửi</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">So sánh dữ liệu tiền gửi giữa 2 quý (T1 và T2)</div>', unsafe_allow_html=True)
+    forecast = summary_branch[['MA_CN', 'TONG_T1', 'TONG_T2', 'TONG_DELTA']].copy()
+    forecast['MOMENTUM'] = forecast.apply(
+        lambda row: (row['TONG_T2'] - row['TONG_T1']) / max(abs(row['TONG_T1']), 1),
+        axis=1
+    )
+    forecast['PREDICT_T3_BASE'] = forecast['TONG_T2'] + (forecast['TONG_T2'] - forecast['TONG_T1'])
+    forecast['PREDICT_T3_OPT'] = forecast['TONG_T2'] + (forecast['TONG_T2'] - forecast['TONG_T1']) * 1.25
+    forecast['PREDICT_T3_PESS'] = forecast['TONG_T2'] + (forecast['TONG_T2'] - forecast['TONG_T1']) * 0.6
+    forecast['BASE_DELTA'] = forecast['PREDICT_T3_BASE'] - forecast['TONG_T2']
+    forecast['OPT_DELTA'] = forecast['PREDICT_T3_OPT'] - forecast['TONG_T2']
+    forecast['PESS_DELTA'] = forecast['PREDICT_T3_PESS'] - forecast['TONG_T2']
+    forecast['CONFIDENCE'] = forecast['MOMENTUM'].abs().apply(
+        lambda x: 'Cao' if x >= 0.30 else ('Trung bình' if x >= 0.10 else 'Thấp')
+    )
+    forecast['FORECAST_DIRECTION'] = forecast['BASE_DELTA'].apply(
+        lambda x: 'TĂNG' if x > 0 else ('GIẢM' if x < 0 else 'ỔN ĐỊNH')
+    )
+    forecast['RISK_NOTE'] = forecast.apply(
+        lambda row: 'Đang mất động lực, xem xét chiến lược giữ chân' if row['BASE_DELTA'] < 0 else
+                    ('Tiếp tục đẩy mạnh sản phẩm hiện tại' if row['BASE_DELTA'] > 0 else 'Duy trì và theo dõi chặt'),
+        axis=1
+    )
+    return forecast.sort_values('BASE_DELTA', ascending=True).reset_index(drop=True)
 
-    # Sidebar wizard
-    with st.sidebar:
-        st.header("🧭 Hướng dẫn 1-2-3")
-        st.write('Upload dữ liệu → Validate → So sánh → Xuất báo cáo')
 
-        with st.expander('🔧 Mapping Cột', expanded=False):
-            st.caption('Điều chỉnh tên cột nguồn về chuẩn trước khi chạy validate.')
-            if st.button('↩️ Reset về chuẩn', use_container_width=True):
-                for canonical in CANONICAL_COLUMNS:
-                    st.session_state[f'map_{canonical}'] = canonical
-                st.rerun()
+def normalize_forecast_columns(forecast: pd.DataFrame) -> pd.DataFrame:
+    """Ensure forecast data has required derived columns for display."""
+    if forecast.empty:
+        return forecast
 
-            for canonical in CANONICAL_COLUMNS:
-                key = f'map_{canonical}'
-                if key not in st.session_state:
-                    st.session_state[key] = canonical
-                st.text_input(f'{canonical}', key=key)
+    df = forecast.copy()
+    if 'PREDICT_T3_BASE' not in df.columns and {'TONG_T1', 'TONG_T2'}.issubset(df.columns):
+        df['PREDICT_T3_BASE'] = df['TONG_T2'] + (df['TONG_T2'] - df['TONG_T1'])
+    if 'BASE_DELTA' not in df.columns and {'PREDICT_T3_BASE', 'TONG_T2'}.issubset(df.columns):
+        df['BASE_DELTA'] = df['PREDICT_T3_BASE'] - df['TONG_T2']
+    if 'PREDICT_T3_OPT' not in df.columns and {'TONG_T1', 'TONG_T2'}.issubset(df.columns):
+        df['PREDICT_T3_OPT'] = df['TONG_T2'] + (df['TONG_T2'] - df['TONG_T1']) * 1.25
+    if 'PREDICT_T3_PESS' not in df.columns and {'TONG_T1', 'TONG_T2'}.issubset(df.columns):
+        df['PREDICT_T3_PESS'] = df['TONG_T2'] + (df['TONG_T2'] - df['TONG_T1']) * 0.6
+    if 'OPT_DELTA' not in df.columns and {'PREDICT_T3_OPT', 'TONG_T2'}.issubset(df.columns):
+        df['OPT_DELTA'] = df['PREDICT_T3_OPT'] - df['TONG_T2']
+    if 'PESS_DELTA' not in df.columns and {'PREDICT_T3_PESS', 'TONG_T2'}.issubset(df.columns):
+        df['PESS_DELTA'] = df['PREDICT_T3_PESS'] - df['TONG_T2']
+    if 'MOMENTUM' not in df.columns and {'TONG_T1', 'TONG_T2'}.issubset(df.columns):
+        df['MOMENTUM'] = df.apply(
+            lambda row: (row['TONG_T2'] - row['TONG_T1']) / max(abs(row['TONG_T1']), 1),
+            axis=1
+        )
+    if 'CONFIDENCE' not in df.columns and 'MOMENTUM' in df.columns:
+        df['CONFIDENCE'] = df['MOMENTUM'].abs().apply(
+            lambda x: 'Cao' if x >= 0.30 else ('Trung bình' if x >= 0.10 else 'Thấp')
+        )
+    if 'FORECAST_DIRECTION' not in df.columns and 'BASE_DELTA' in df.columns:
+        df['FORECAST_DIRECTION'] = df['BASE_DELTA'].apply(
+            lambda x: 'TĂNG' if x > 0 else ('GIẢM' if x < 0 else 'ỔN ĐỊNH')
+        )
+    if 'RISK_NOTE' not in df.columns and 'BASE_DELTA' in df.columns:
+        df['RISK_NOTE'] = df.apply(
+            lambda row: 'Đang mất động lực, xem xét chiến lược giữ chân' if row['BASE_DELTA'] < 0 else
+                        ('Tiếp tục đẩy mạnh sản phẩm hiện tại' if row['BASE_DELTA'] > 0 else 'Duy trì và theo dõi chặt'),
+            axis=1
+        )
+    return df
 
-            current_mapping = get_current_column_mapping()
-            st.download_button(
-                label='⬇️ Tải template CSV chuẩn',
-                data=generate_template_csv(current_mapping),
-                file_name='template_so_sanh_tien_gui.csv',
-                mime='text/csv',
-                use_container_width=True,
-                help='Template dùng đúng mapping cột hiện tại.',
-            )
 
-        with st.expander('📁 Upload dữ liệu', expanded=True):
-            t1_files = st.file_uploader(
-                'T1 - Quý trước',
-                type='csv',
-                accept_multiple_files=True,
-                key='t1_files',
-            )
-            t2_files = st.file_uploader(
-                'T2 - Quý đối chiếu',
-                type='csv',
-                accept_multiple_files=True,
-                key='t2_files',
-            )
+def build_ai_insights(data: Dict) -> List[str]:
+    """Generate simple AI-style insights based on analysis data."""
+    comparison_df = data.get('comparison', pd.DataFrame())
+    alert_summary = data.get('alert_summary', pd.DataFrame())
+    prediction = data.get('prediction', pd.DataFrame())
 
-            if t1_files:
-                st.info(f'Thêm {len(t1_files)} file T1')
-            if t2_files:
-                st.info(f'Thêm {len(t2_files)} file T2')
+    insights = []
+    if comparison_df.empty:
+        return insights
 
-        current_mapping = get_current_column_mapping()
-        has_upload = bool(st.session_state.get('t1_files') and st.session_state.get('t2_files'))
-        has_validation = st.session_state.validation_result is not None
-        has_processed = st.session_state.processed_data is not None
+    total_delta = float(comparison_df['DELTA'].sum())
+    if total_delta > 0:
+        insights.append(f"Tổng DELTA tích cực: {total_delta:,.0f}. Xu hướng thị trường hiện đang tăng.")
+    elif total_delta < 0:
+        insights.append(f"Tổng DELTA âm: {total_delta:,.0f}. Thị trường đang bị kéo xuống, cần tập trung giữ chân khách hàng." )
+    else:
+        insights.append("Tổng DELTA gần bằng 0, thị trường đang ổn định nhưng vẫn cần theo dõi các biến động nhỏ.")
 
-        st.markdown('---')
-        st.subheader('🚦 Trạng thái')
-        st.write(
-            f"- {'✅' if has_upload else '⬜'} Upload dữ liệu\n"
-            f"- {'✅' if has_validation else '⬜'} Validate\n"
-            f"- {'✅' if has_processed else '⬜'} So sánh\n"
-            f"- {'✅' if has_processed else '⬜'} Xuất báo cáo"
+    top_branch = data['summary_branch'].sort_values('TONG_DELTA', ascending=False).head(1)
+    if not top_branch.empty:
+        row = top_branch.iloc[0]
+        insights.append(f"Chi nhánh đang dẫn đầu tăng trưởng: {row['MA_CN']} với DELTA {row['TONG_DELTA']:,.0f}.")
+
+    if not alert_summary.empty:
+        insights.append(f"Đang có {len(alert_summary)} cảnh báo quan trọng cần xử lý ngay.")
+
+    if not prediction.empty:
+        bad_forecast = prediction[prediction['FORECAST_DIRECTION'] == 'GIẢM']
+        good_forecast = prediction[prediction['FORECAST_DIRECTION'] == 'TĂNG']
+        if len(bad_forecast) > 0:
+            insights.append(f"{len(bad_forecast)} chi nhánh dự báo giảm vòng tới, cần ưu tiên giữ chân.")
+        if len(good_forecast) > 0:
+            insights.append(f"{len(good_forecast)} chi nhánh dự báo tăng, có thể mở rộng sản phẩm/tài trợ.")
+
+    top_clients = data.get('top_customers', {}).get('top_gainers', pd.DataFrame())
+    if not top_clients.empty:
+        best = top_clients.iloc[0]
+        insights.append(f"Khách hàng tăng mạnh nhất: {best.get('TEN_KH', 'N/A')} với DELTA {best.get('DELTA', 0):,.0f}.")
+
+    # Strategy recommendation summary
+    recommendations_df = data.get('recommendations', pd.DataFrame())
+    if not recommendations_df.empty and 'MUC_UU_TIEN' in recommendations_df.columns:
+        high_risk = len(recommendations_df[recommendations_df['MUC_UU_TIEN'] == 'RAT_CAO'])
+        if high_risk > 0:
+            insights.append(f"Có {high_risk} khách hàng ưu tiên RẤT CAO cần xử lý trong 48h.")
+
+    if not data.get('segment_summary', pd.DataFrame()).empty:
+        worst_segment = data['segment_summary'].sort_values('TONG_DELTA').head(1)
+        if not worst_segment.empty:
+            detail = worst_segment.iloc[0]
+            insights.append(f"Phân khúc {detail['BALANCE_BUCKET']} đang giảm mạnh, cần rà soát chính sách chăm sóc.")
+
+    return insights
+
+
+def build_market_context(data: Dict) -> List[str]:
+    comparison_df = data.get('comparison', pd.DataFrame())
+    summary_branch = data.get('summary_branch', pd.DataFrame())
+    summary_product = data.get('summary_product', pd.DataFrame())
+    segment_summary = data.get('segment_summary', pd.DataFrame())
+
+    if comparison_df.empty:
+        return [
+            "Chưa có dữ liệu đủ để xác định bối cảnh thị trường hiện tại.",
+            "Vui lòng hoàn thành bước so sánh để nhận định xu hướng vốn và thị trường." 
+        ]
+
+    total_delta = float(comparison_df['DELTA'].sum())
+    total_t1 = float(comparison_df['TOTAL_T1'].sum())
+    total_t2 = float(comparison_df['TOTAL_T2'].sum())
+    branch_up = len(summary_branch[summary_branch['TONG_DELTA'] > 0]) if not summary_branch.empty else 0
+    branch_down = len(summary_branch[summary_branch['TONG_DELTA'] < 0]) if not summary_branch.empty else 0
+    positive_product = summary_product.sort_values('TONG_DELTA', ascending=False).head(2)
+    negative_product = summary_product.sort_values('TONG_DELTA').head(2)
+    worst_segment = segment_summary.sort_values('TONG_DELTA').head(1) if not segment_summary.empty else pd.DataFrame()
+
+    market_situation = 'TĂNG' if total_delta > 0 else ('GIẢM' if total_delta < 0 else 'ỔN ĐỊNH')
+    growth_rate = (total_delta / max(abs(total_t1), 1))
+
+    context = [
+        "Dữ liệu T1/T2 đã phản ánh bối cảnh thị trường tiền gửi hiện tại, bao gồm xu hướng dòng vốn, mức độ cạnh tranh lãi suất và hành vi khách hàng.",
+        f"Tổng tiền gửi T1: {total_t1:,.0f}, T2: {total_t2:,.0f}, DELTA: {total_delta:,.0f}. Thị trường nội bộ đang có xu hướng {market_situation.lower()} với tốc độ biến động {growth_rate:.2%}.",
+        f"Có {branch_up} chi nhánh tăng trưởng và {branch_down} chi nhánh chịu áp lực giảm. Đây là tín hiệu quan trọng để xác định vùng cần huy động vốn và giữ chân khách hàng.",
+    ]
+
+    if not positive_product.empty:
+        products = ", ".join([str(x) for x in positive_product['DP_GROUP'].tolist()])
+        context.append(
+            f"Sản phẩm tăng trưởng tốt hiện tại: {products}. Đây là những nhóm sản phẩm có thể được đẩy mạnh trong chiến lược huy động vốn để tận dụng xu hướng thị trường."
+        )
+    if not negative_product.empty:
+        products = ", ".join([str(x) for x in negative_product['DP_GROUP'].tolist()])
+        context.append(
+            f"Sản phẩm suy yếu cần tái cấu trúc: {products}. Nên xem xét gói lãi suất mới, chương trình khuyến mại hoặc kết hợp với sản phẩm phái sinh để thu hút vốn trở lại."
+        )
+    if not worst_segment.empty:
+        detail = worst_segment.iloc[0]
+        context.append(
+            f"Phân khúc có biến động tiêu cực nhất hiện nay là {detail['BALANCE_BUCKET']} với DELTA {detail['TONG_DELTA']:,.0f}. Phải có giải pháp giữ chân và gia tăng tỷ lệ tiền gửi ổn định cho phân khúc này."
         )
 
-        validate_clicked = st.button('2️⃣ Kiểm tra dữ liệu', disabled=not has_upload, use_container_width=True)
-        compare_clicked = st.button('3️⃣ So sánh dữ liệu', disabled=not has_validation, type='primary', use_container_width=True)
+    context.append(
+        "Trong bối cảnh thị trường cạnh tranh hiện tại, nguồn vốn ưu tiên thu hút là tiền gửi kỳ hạn linh hoạt, ưu đãi lãi suất và các gói cộng điểm cho khách hàng mới/toàn phần."
+    )
+    context.append(
+        "Thị trường hiện đang phản ánh nhu cầu khách hàng dịch chuyển sang sản phẩm có giá trị gia tăng: tiết kiệm online, ưu đãi lãi suất cố định và gói kết hợp đầu tư/bảo hiểm."
+    )
 
-        if validate_clicked:
-            try:
-                temp_dir = tempfile.mkdtemp()
-                t1_paths = save_uploaded_files(t1_files, temp_dir)
-                t2_paths = save_uploaded_files(t2_files, temp_dir)
-                validation = validate_all_files(t1_paths, t2_paths, column_mapping=current_mapping)
+    # Add interest rate benchmark insights
+    interest_insights = get_interest_rate_insights(5.5)  # Assume 5.5% internal average
+    context.extend(interest_insights)
 
-                t1_meta = collect_file_metadata(t1_files)
-                t2_meta = collect_file_metadata(t2_files)
-                cache_key = build_cache_key(t1_meta, t2_meta, current_mapping)
+    # Add AI-powered insights
+    try:
+        # Get customer data for AI analysis
+        customer_data = data.get('customer_data', pd.DataFrame())
+        if not customer_data.empty:
+            # Customer segmentation
+            segmentation = perform_customer_segmentation(customer_data)
+            if 'insights' in segmentation:
+                context.append("\n" + segmentation['insights'])
 
-                st.session_state.validation_result = validation
-                st.session_state.upload_context = {
-                    'temp_dir': temp_dir,
-                    't1_paths': t1_paths,
-                    't2_paths': t2_paths,
-                    't1_meta': t1_meta,
-                    't2_meta': t2_meta,
-                    'cache_key': cache_key,
-                    'column_mapping': current_mapping,
-                }
-                st.session_state.processed_data = None
-                st.success('✅ Dữ liệu hợp lệ. Có thể chuyển sang bước 3.')
-            except ValidationError as e:
-                st.session_state.validation_result = None
-                st.session_state.upload_context = None
-                render_friendly_error(str(e))
-            except Exception as e:
-                st.session_state.validation_result = None
-                st.session_state.upload_context = None
-                render_friendly_error(f'Lỗi không xác định: {str(e)}')
+            # Churn risk analysis
+            churn_analysis = predict_churn_risk(customer_data)
+            if 'insights' in churn_analysis:
+                context.append("\n" + churn_analysis['insights'])
 
-        if compare_clicked:
-            try:
-                upload_context = st.session_state.upload_context
-                if not upload_context:
-                    st.warning('Vui lòng chạy bước 2 trước.')
-                elif upload_context['column_mapping'] != current_mapping:
-                    st.warning('Bạn đã đổi mapping cột. Vui lòng validate lại ở bước 2.')
-                else:
-                    progress = st.progress(0)
-                    status = st.empty()
+            # AI recommendations
+            recommendations = generate_ai_recommendations(customer_data)
+            context.append("\n" + recommendations)
+    except Exception as e:
+        context.append(f"\n⚠️ Không thể tạo insights AI: {str(e)}")
 
-                    cache_key = upload_context['cache_key']
-                    cache_hit = cache_key in st.session_state.processing_cache
+    return context
 
-                    status.text('⚙️ Đang xử lý đối chiếu...')
-                    progress.progress(35)
 
-                    if cache_hit:
-                        processed = st.session_state.processing_cache[cache_key]
-                    else:
-                        processed = process_data(
-                            upload_context['t1_paths'],
-                            upload_context['t2_paths'],
-                            st.session_state.validation_result,
-                            column_mapping=current_mapping,
-                        )
-                        st.session_state.processing_cache[cache_key] = processed
+def build_capital_strategy(data: Dict) -> List[Dict[str, str]]:
+    comparison_df = data.get('comparison', pd.DataFrame())
+    summary_branch = data.get('summary_branch', pd.DataFrame())
+    summary_product = data.get('summary_product', pd.DataFrame())
+    segment_summary = data.get('segment_summary', pd.DataFrame())
 
-                    status.text('💾 Đang lưu kết quả...')
-                    progress.progress(85)
-                    st.session_state.processed_data = processed
-                    progress.progress(100)
-                    status.text('✅ Hoàn tất')
+    total_delta = float(comparison_df['DELTA'].sum()) if not comparison_df.empty else 0
+    is_negative_market = total_delta < 0
+    strategies = []
 
-                    comparison_df = processed['comparison']
-                    append_history({
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'cache_key': cache_key,
-                        't1_input_files': ';'.join([item['name'] for item in upload_context['t1_meta']]),
-                        't2_input_files': ';'.join([item['name'] for item in upload_context['t2_meta']]),
-                        't1_files': len(upload_context['t1_meta']),
-                        't2_files': len(upload_context['t2_meta']),
-                        't1_date': st.session_state.validation_result.get('t1_date', ''),
-                        't2_date': st.session_state.validation_result.get('t2_date', ''),
-                        'branches': len(st.session_state.validation_result.get('branch_dates', {})),
-                        'customers': len(comparison_df),
-                        'total_t1': round(float(comparison_df['TOTAL_T1'].sum()), 2) if not comparison_df.empty else 0,
-                        'total_t2': round(float(comparison_df['TOTAL_T2'].sum()), 2) if not comparison_df.empty else 0,
-                        'total_delta': round(float(comparison_df['DELTA'].sum()), 2) if not comparison_df.empty else 0,
-                        'high_risk_customers': len(processed['recommendations'][processed['recommendations']['MUC_UU_TIEN'] == 'RAT_CAO']) if not processed['recommendations'].empty else 0,
-                        'cache_hit': 'YES' if cache_hit else 'NO',
-                    })
+    strategies.append({
+        'title': '1. Giữ chân khách hàng có DELTA âm lớn',
+        'description': (
+            "- Ưu tiên tiếp cận ngay lập tức các khách hàng giảm mạnh, đặc biệt nhóm tất toán và giảm > ngưỡng nguy cơ. "
+            "- Triển khai chương trình chăm sóc cao cấp, miễn phí chuyển tiền, tặng quà hoặc nâng cấp lãi suất cho kỳ hạn tiếp theo. "
+            "- Giao cho đội chuyên trách phụ trách giữ chân nhóm này, cam kết phản hồi trong 24-48 tiếng."
+        )
+    })
 
-                    # Save processed data to persistent cache
-                    if not cache_hit:
-                        save_processed_data(cache_key, processed)
+    strategies.append({
+        'title': '2. Triển khai giải pháp huy động vốn cho khách hàng mới và mở mới',
+        'description': (
+            "- Dùng dữ liệu MO_MOI để xác định khách hàng mở mới giá trị cao và tặng ưu đãi lãi suất chào mừng. "
+            "- Thiết kế gói sản phẩm tiền gửi kết hợp dịch vụ số, ưu đãi phí và trao đổi thông tin qua kênh online để rút ngắn thời gian onboarding. "
+            "- Áp dụng cơ chế thẩm định nhanh, hỗ trợ tư vấn 1-1 cho khách hàng có tổng tài sản lớn."
+        )
+    })
 
-                    st.success('✅ So sánh thành công!')
-            except Exception as e:
-                render_friendly_error(f'Lỗi xử lý bước 3: {str(e)}')
+    strategies.append({
+        'title': '3. Tập trung sản phẩm tốt nhất theo xu hướng thị trường',
+        'description': (
+            "- Đẩy mạnh các sản phẩm có DELTA tích cực, tận dụng sức hút của nhóm sản phẩm này để thu hút vốn mới. "
+            "- Với sản phẩm suy yếu, kiểm tra lại chính sách lãi suất, kỳ hạn, điều kiện chuyển đổi và truyền thông. "
+            "- Khuyến nghị các gói tiết kiệm kỳ hạn 6-12 tháng, kết hợp quà tặng hoặc nâng mức lãi suất nếu khách hàng gửi thêm."
+        )
+    })
 
-        with st.expander('🕘 Lịch sử so sánh', expanded=False):
-            history_df = load_history()
-            if history_df.empty:
-                st.caption('Chưa có lịch sử xử lý.')
-            else:
-                # Add history selection for loading full results (only if cache_key column exists)
-                if 'cache_key' in history_df.columns:
-                    history_options = []
-                    for idx, row in history_df.iterrows():
-                        option = f"{row['timestamp']} - {row['t1_date']}→{row['t2_date']} ({row['customers']} KH, {row.get('total_delta', 0):,.0f}đ)"
-                        history_options.append((row['cache_key'], option))
+    strategies.append({
+        'title': '4. Chiến lược vốn theo chi nhánh và phân khúc',
+        'description': (
+            "- Xác định chi nhánh có áp lực giảm mạnh và tăng cường hỗ trợ nguồn lực, thưởng KPI cho huy động vốn. "
+            "- Với chi nhánh tăng trưởng tốt, mở rộng gói ưu đãi cho khách hàng có DELTA cao để dòng vốn giữ được ổn định. "
+            "- Phân tích sâu phân khúc <50M, 50-200M, 200-500M, >500M và xây dựng chương trình riêng cho từng nhóm."
+        )
+    })
 
-                    if history_options:  # Only show selectbox if there are options
-                        # Create mapping for format_func to avoid StopIteration
-                        cache_to_option = {opt[0]: opt[1] for opt in history_options}
-                        
-                        selected_history = st.selectbox(
-                            'Chọn lịch sử để xem chi tiết:',
-                            options=[opt[0] for opt in history_options],
-                            format_func=lambda x: cache_to_option.get(x, f"Cache {x}"),
-                            key='history_selector'
-                        )
+    strategies.append({
+        'title': '5. Chủ động phản ánh thị trường hiện tại',
+        'description': (
+            "- Nếu thị trường đang giảm tổng DELTA, cần tăng cường thông điệp giữ chân và ưu đãi lãi suất để bù đắp nguồn vốn bị rút ra. "
+            "- Nếu thị trường đang tăng, ưu tiên giữ nhịp tăng trưởng bằng cách giới thiệu gói chuyển tiền linh hoạt, gói tích lũy lãi suất cao. "
+            "- Luôn phản hồi thông tin thị trường qua các báo cáo hàng tuần, cập nhật biến động lãi suất và đối thủ cạnh tranh."
+        )
+    })
 
-                        if st.button('📊 Tải kết quả phân tích', use_container_width=True):
-                            with st.spinner('Đang tải kết quả lịch sử...'):
-                                loaded_data = load_processed_data(selected_history)
-                                if loaded_data and 'comparison' in loaded_data and not loaded_data['comparison'].empty:
-                                    st.session_state.history_loaded_data = loaded_data
-                                    st.session_state.history_timestamp = next((getattr(row, 'timestamp', 'Unknown') for row in history_df.itertuples() if getattr(row, 'cache_key', None) == selected_history), "Unknown")
-                                    st.success('✅ Đã tải kết quả lịch sử! Xem ở tab "📊 Phân tích"')
-                                    st.rerun()
-                                else:
-                                    st.error('❌ Không thể tải kết quả lịch sử này (cache không khả dụng)')
-                    else:
-                        st.caption('Chưa có lịch sử nào hỗ trợ xem chi tiết.')
-                else:
-                    st.info('💡 Tính năng xem chi tiết lịch sử sẽ khả dụng cho các lần chạy mới.')
-
-                st.divider()
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label='⬇️ Tải lịch sử CSV',
-                        data=history_df.to_csv(index=False).encode('utf-8-sig'),
-                        file_name='comparison_history_recent.csv',
-                        mime='text/csv',
-                        use_container_width=True,
-                    )
-                with col2:
-                    if st.button('🧹 Dọn dẹp cache cũ', use_container_width=True, help='Xóa cache entries cũ hơn 30 ngày'):
-                        cleanup_old_cache(30)
-
-        with st.expander('💡 Mẹo nhanh'):
-            st.markdown(
-                """
-                - Tên file: `{MA_CN}_dp01_yyyymmdd.csv`
-                - Nếu cột nguồn khác chuẩn, chỉ cần đổi ở phần Mapping Cột
-                - Upload lại cùng file sẽ tận dụng cache để chạy nhanh hơn
-                - Dùng template để gửi format chuẩn cho các đơn vị
-                """
+    if is_negative_market:
+        strategies.append({
+            'title': '6. Giải pháp gia tăng vốn trong thị trường áp lực',
+            'description': (
+                "- Triển khai chương trình ưu đãi lãi suất ngắn hạn + gói quà tặng cho khách hàng chuyển đổi sang gửi tiền kỳ hạn dài. "
+                "- Khuyến khích khách hàng gửi thêm bằng cơ chế thưởng lũy tiến, cộng thêm lãi suất cho số tiền gửi mới. "
+                "- Tập trung vào sản phẩm thanh khoản cao, giải pháp tiền gửi linh hoạt để khách hàng yên tâm lưu giữ vốn."
             )
-
-    # Main content area
-    if 'history_loaded_data' in st.session_state and st.session_state.history_loaded_data:
-        st.info(f"📚 Đang xem kết quả lịch sử: {st.session_state.get('history_timestamp', 'N/A')}")
-        if st.button('🔄 Quay lại kết quả hiện tại', key='back_to_current'):
-            del st.session_state.history_loaded_data
-            if 'history_timestamp' in st.session_state:
-                del st.session_state.history_timestamp
-            st.rerun()
-        st.divider()
-        data = st.session_state.history_loaded_data
-    elif st.session_state.processed_data is not None:
-        data = st.session_state.processed_data
+        })
     else:
-        data = None
-
-    if data is not None:
-        comparison_df = data['comparison']
-
-        st.markdown('### 📊 Tóm Tắt Nhanh')
-        branch_count = len(data['summary_branch'])
-        new_customers = int((comparison_df['BIEN_DONG'] == 'MO_MOI').sum())
-        churn_customers = int((comparison_df['BIEN_DONG'] == 'TAT_TOAN').sum())
-        growth_customers = int((comparison_df['BIEN_DONG'] == 'TANG').sum())
-        total_delta = float(comparison_df['DELTA'].sum())
-        average_delta = float(comparison_df['DELTA'].mean()) if not comparison_df.empty else 0
-        alert_count = len(data['alert_summary']) if data.get('alert_summary') is not None else 0
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric('🏢 Chi Nhánh', branch_count)
-        with col2:
-            st.metric('📈 Tổng KH', len(comparison_df))
-        with col3:
-            st.metric('🆕 Mở Mới', new_customers)
-        with col4:
-            st.metric('🔚 Tất Toán', churn_customers)
-        with col5:
-            st.metric('💰 Tổng Δ', f"{total_delta:,.0f}")
-
-        subcol1, subcol2, subcol3, subcol4 = st.columns(4)
-        with subcol1:
-            st.metric('📊 Tăng', growth_customers)
-        with subcol2:
-            st.metric('⚠️ Cảnh báo', alert_count)
-        with subcol3:
-            st.metric('📉 Trung bình Δ', f"{average_delta:,.0f}")
-        with subcol4:
-            st.metric('📈 Tỷ lệ tăng trưởng', f"{(total_delta / max(float(comparison_df['TOTAL_T1'].sum()), 1) * 100):.2f}%")
-
-        st.divider()
-        st.subheader('4️⃣ Chọn báo cáo để xem / xuất')
-        tabs = st.tabs(['📊 Tổng quan', '📋 Chi tiết', '⚠️ Cảnh báo', '🎯 Khuyến nghị', '💾 Báo cáo'])
-
-        with tabs[0]:
-            tab_dashboard(data)
-
-        with tabs[1]:
-            tab_customer_details(data)
-            st.divider()
-            tab_branch_summary(data)
-            st.divider()
-            tab_customer_type_summary(data)
-            st.divider()
-            tab_segment_analysis(data)
-            st.divider()
-            tab_product_summary(data)
-            st.divider()
-            tab_top_customers(data)
-
-        with tabs[2]:
-            tab_alerts(data)
-            st.divider()
-            tab_outliers(data)
-
-        with tabs[3]:
-            tab_action_recommendations(data)
-            st.divider()
-            tab_driver_analysis(data)
-
-        with tabs[4]:
-            tab_charts(data)
-            st.divider()
-            tab_export(data)
-    else:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.markdown(
-                """
-                <div class="step-guide">
-                    <h3>👋 Quy Trình 4 Bước</h3>
-                    <ol>
-                        <li>Upload dữ liệu T1 và T2</li>
-                        <li>Validate cấu trúc và tên file</li>
-                        <li>Chạy so sánh</li>
-                        <li>Xem báo cáo và xuất Excel</li>
-                    </ol>
-                    <p>👉 Nếu dữ liệu nguồn khác tên cột chuẩn, chỉnh trong phần <b>Mapping Cột</b>.</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
+        strategies.append({
+            'title': '6. Giải pháp mở rộng huy động vốn khi thị trường đang thuận lợi',
+            'description': (
+                "- Kéo dài hiệu quả tăng trưởng bằng các chương trình khách hàng thân thiết, ưu đãi mở rộng hạn mức gửi. "
+                "- Phát triển thêm các gói sản phẩm tích hợp gửi tiết kiệm + đầu tư / bảo hiểm để tăng lượng vốn tại khách hàng hiện hữu. "
+                "- Tăng tốc marketing vào phân khúc có delta dương mạnh để tận dụng dư địa thị trường."
             )
+        })
+
+    strategies.append({
+        'title': '7. Huy động vốn và chăm sóc đồng bộ',
+        'description': (
+            "- Liên kết đội kinh doanh, chăm sóc và sản phẩm để triển khai chiến dịch huy động vốn đồng bộ. "
+            "- Dùng dữ liệu so sánh T1-T2 để làm căn cứ cho kịch bản hành động, báo cáo thị trường và đề xuất ưu đãi. "
+            "- Định kỳ đo lường hiệu quả từng chiến dịch và điều chỉnh dựa trên kết quả thực tế."
+        )
+    })
+
+    return strategies
 
 
-def process_data(t1_paths, t2_paths, validation, column_mapping=None):
-    """Process uploaded data and generate statistics."""
-    
-    # Create file mapping
-    file_mapping = {}
-    branch_dates = validation['branch_dates']
-    
-    # Create mapping from file paths
-    t1_by_name = {os.path.basename(p): p for p in t1_paths}
-    t2_by_name = {os.path.basename(p): p for p in t2_paths}
-    
-    for ma_cn in branch_dates.keys():
-        t1_date, t2_date = branch_dates[ma_cn]
-        t1_filename = f"{ma_cn}_dp01_{t1_date}.csv"
-        t2_filename = f"{ma_cn}_dp01_{t2_date}.csv"
-        
-        if t1_filename in t1_by_name and t2_filename in t2_by_name:
-            file_mapping[ma_cn] = (t1_by_name[t1_filename], t2_by_name[t2_filename])
-    
-    # Load and process data
-    all_raw_data = {}
-    all_aggregated = {}
-    comparison_results = []
-    
-    for ma_cn, (t1_file, t2_file) in file_mapping.items():
-        # Load data
-        df_t1 = load_and_normalize_csv(t1_file, column_mapping=column_mapping)
-        df_t2 = load_and_normalize_csv(t2_file, column_mapping=column_mapping)
-        
-        all_raw_data[ma_cn] = {'T1': df_t1, 'T2': df_t2}
-        
-        # Filter invalid data
-        df_t1_filtered = filter_valid_data(df_t1)
-        df_t2_filtered = filter_valid_data(df_t2)
-        
-        # Aggregate
-        agg_t1, agg_t2 = aggregate_pair(df_t1_filtered, df_t2_filtered)
-        all_aggregated[ma_cn] = {'T1': agg_t1, 'T2': agg_t2}
-        
-        # Compare
-        comparison = merge_and_compare(agg_t1, agg_t2, ma_cn)
-        comparison_results.append(comparison)
-    
-    # Combine all comparisons
-    comparison_df = pd.concat(comparison_results, ignore_index=True) if comparison_results else pd.DataFrame()
+def extract_action_insight_cards(data: Dict) -> List[Dict[str, str]]:
+    """Generate a short set of action cards for AI insights."""
+    cards = []
+    comparison_df = data.get('comparison', pd.DataFrame())
+    forecast = data.get('prediction', pd.DataFrame())
+    recommendations = data.get('recommendations', pd.DataFrame())
+
     if not comparison_df.empty:
+        total_delta = float(comparison_df['DELTA'].sum())
+        cards.append({
+            'title': 'Tổng trạng',
+            'message': f"Tổng DELTA hiện tại {total_delta:,.0f}. {'Tăng trưởng tích cực' if total_delta > 0 else 'Cần chú ý nếu giảm' if total_delta < 0 else 'Ổn định'}.",
+            'type': 'summary'
+        })
+
+    if not forecast.empty:
+        risk_count = len(forecast[forecast['FORECAST_DIRECTION'] == 'GIẢM'])
+        opp_count = len(forecast[forecast['FORECAST_DIRECTION'] == 'TĂNG'])
+        cards.append({
+            'title': 'Dự báo chi nhánh',
+            'message': f"{risk_count} chi nhánh có xu hướng giảm và {opp_count} chi nhánh có xu hướng tăng trong kỳ tới.",
+            'type': 'forecast'
+        })
+
+    if not recommendations.empty and 'MUC_UU_TIEN' in recommendations.columns:
+        urgent = len(recommendations[recommendations['MUC_UU_TIEN'] == 'RAT_CAO'])
+        cards.append({
+            'title': 'Hành động ưu tiên',
+            'message': f"Có {urgent} khách hàng cần ưu tiên xử lý ngay để giảm thiểu rủi ro mất tiền.",
+            'type': 'action'
+        })
+
+    return cards
+
+
+def export_custom_report_to_excel(data: Dict, selected_sections: List[str]) -> bytes:
+    """Export selected report sections to Excel."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        if 'Dashboard' in selected_sections:
+            metrics = [
+                ('Tổng khách hàng', len(data['comparison'])),
+                ('Tổng T1', format_money(data['summary_branch']['TONG_T1'].sum())),
+                ('Tổng T2', format_money(data['summary_branch']['TONG_T2'].sum())),
+                ('Tổng DELTA', format_money(data['summary_branch']['TONG_DELTA'].sum())),
+            ]
+            pd.DataFrame(metrics, columns=['Chỉ số', 'Giá trị']).to_excel(writer, sheet_name='Dashboard', index=False)
+
+        if 'Customer details' in selected_sections and not data['comparison'].empty:
+            data['comparison'].to_excel(writer, sheet_name='ChiTietKhachHang', index=False)
+
+        if 'Branch summary' in selected_sections and not data['summary_branch'].empty:
+            data['summary_branch'].to_excel(writer, sheet_name='TheoChiNhanh', index=False)
+
+        if 'Customer type' in selected_sections and not data['summary_cust_type'].empty:
+            data['summary_cust_type'].to_excel(writer, sheet_name='TheoPhanKhuc', index=False)
+
+        if 'Product summary' in selected_sections and not data['summary_product'].empty:
+            data['summary_product'].to_excel(writer, sheet_name='TheoSanPham', index=False)
+
+        if 'Segment analysis' in selected_sections and not data.get('segment_summary', pd.DataFrame()).empty:
+            data['segment_summary'].to_excel(writer, sheet_name='PhanKhuc', index=False)
+
+        if 'Market context' in selected_sections and data.get('market_context'):
+            pd.DataFrame({'Nội dung': data['market_context']}).to_excel(writer, sheet_name='MarketContext', index=False)
+
+        if 'Capital strategy' in selected_sections and data.get('capital_strategy'):
+            pd.DataFrame(data['capital_strategy']).to_excel(writer, sheet_name='CapitalStrategy', index=False)
+
+        if 'Alerts' in selected_sections and not data.get('alert_summary', pd.DataFrame()).empty:
+            data['alert_summary'].to_excel(writer, sheet_name='CanhBao', index=False)
+
+        if 'Recommendations' in selected_sections and not data.get('recommendations', pd.DataFrame()).empty:
+            data['recommendations'].to_excel(writer, sheet_name='KhuyenNghi', index=False)
+
+        if 'Predictive' in selected_sections and not data.get('prediction', pd.DataFrame()).empty:
+            data['prediction'].to_excel(writer, sheet_name='DuBao', index=False)
+
+        if 'AI Insights' in selected_sections and data.get('ai_insights'):
+            pd.DataFrame({'Insight': data['ai_insights']}).to_excel(writer, sheet_name='AIInsights', index=False)
+
+        if 'Charts' in selected_sections:
+            chart_sources = {
+                'Branch growth': data.get('summary_branch', pd.DataFrame()),
+                'Customer type data': data.get('summary_cust_type', pd.DataFrame()),
+                'Product group data': data.get('summary_product', pd.DataFrame()),
+                'Change distribution': data.get('summary_change', pd.DataFrame()),
+            }
+            for sheet_name, df in chart_sources.items():
+                if df is not None and not df.empty:
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def tab_dashboard(data: Dict) -> None:
+    """Render main dashboard with key charts and insights."""
+    st.header('📊 Dashboard Tổng quan')
+
+    comparison_df = data.get('comparison', pd.DataFrame())
+    summary_branch = data.get('summary_branch', pd.DataFrame())
+
+    if comparison_df.empty:
+        st.info('Chưa có dữ liệu so sánh để hiển thị dashboard.')
+        return
+
+    # Key charts row
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Branch performance chart
+        if not summary_branch.empty and 'TONG_DELTA' in summary_branch.columns:
+            fig_branch = px.bar(
+                summary_branch.head(10),
+                x='MA_CN',
+                y='TONG_DELTA',
+                title='Top 10 Chi nhánh theo DELTA',
+                color='TONG_DELTA',
+                color_continuous_scale='RdYlGn'
+            )
+            fig_branch.update_layout(height=400)
+            st.plotly_chart(fig_branch, use_container_width=True)
+
+    with col2:
+        # Customer change distribution
+        if 'BIEN_DONG' in comparison_df.columns:
+            change_counts = comparison_df['BIEN_DONG'].value_counts()
+            fig_change = px.pie(
+                values=change_counts.values,
+                names=change_counts.index,
+                title='Phân bố biến động khách hàng'
+            )
+            fig_change.update_layout(height=400)
+            st.plotly_chart(fig_change, use_container_width=True)
+
+    st.divider()
+
+    # Growth trends
+    col3, col4 = st.columns(2)
+
+    with col3:
+        # Balance distribution
+        if 'TOTAL_T2' in comparison_df.columns:
+            fig_balance = px.histogram(
+                comparison_df,
+                x='TOTAL_T2',
+                nbins=50,
+                title='Phân bố số dư T2',
+                marginal='box'
+            )
+            fig_balance.update_layout(height=350)
+            st.plotly_chart(fig_balance, use_container_width=True)
+
+    with col4:
+        # Growth rate by branch
+        if not summary_branch.empty and {'TONG_T1', 'TONG_T2'}.issubset(summary_branch.columns):
+            summary_branch_copy = summary_branch.copy()
+            summary_branch_copy['GROWTH_RATE'] = (
+                (summary_branch_copy['TONG_T2'] - summary_branch_copy['TONG_T1']) /
+                summary_branch_copy['TONG_T1'].clip(lower=1) * 100
+            )
+            fig_growth = px.bar(
+                summary_branch_copy.head(10),
+                x='MA_CN',
+                y='GROWTH_RATE',
+                title='Tỷ lệ tăng trưởng theo chi nhánh (%)',
+                color='GROWTH_RATE',
+                color_continuous_scale='RdYlGn'
+            )
+            fig_growth.update_layout(height=350)
+            st.plotly_chart(fig_growth, use_container_width=True)
+
+
+def tab_customer_details(data: Dict) -> None:
+    """Display customer-level comparison details."""
+    st.header('📋 Chi tiết khách hàng')
+    comparison_df = data.get('comparison', pd.DataFrame())
+    if comparison_df.empty:
+        placeholder = st.container(key='info_no_customer_data')
+        placeholder.info('Chưa có dữ liệu khách hàng để hiển thị. Vui lòng chạy so sánh trước.')
+        return
+
+    comparison_df = comparison_df.copy()
+    comparison_df['DELTA'] = comparison_df['DELTA'].fillna(0)
+    comparison_df['TOTAL_T1'] = comparison_df.get('TOTAL_T1', 0)
+    comparison_df['TOTAL_T2'] = comparison_df.get('TOTAL_T2', 0)
+
+    branches = sorted(comparison_df['MA_CN'].dropna().unique().tolist()) if 'MA_CN' in comparison_df.columns else []
+    customer_types = sorted(comparison_df['CUST_TYPE_NAME'].dropna().unique().tolist()) if 'CUST_TYPE_NAME' in comparison_df.columns else []
+    change_types = sorted(comparison_df['BIEN_DONG'].dropna().unique().tolist()) if 'BIEN_DONG' in comparison_df.columns else []
+
+    with st.expander('Bộ lọc khách hàng', expanded=True):
+        col1, col2, col3 = st.columns(3)
+        selected_branch = col1.selectbox('Chi nhánh', options=['Tất cả'] + branches, index=0)
+        selected_cust_type = col2.selectbox('Phân khúc khách hàng', options=['Tất cả'] + customer_types, index=0)
+        selected_change_type = col3.selectbox('Loại biến động', options=['Tất cả'] + change_types, index=0)
+
+    filtered_df = comparison_df
+    if selected_branch != 'Tất cả':
+        filtered_df = filtered_df[filtered_df['MA_CN'] == selected_branch]
+    if selected_cust_type != 'Tất cả':
+        filtered_df = filtered_df[filtered_df['CUST_TYPE_NAME'] == selected_cust_type]
+    if selected_change_type != 'Tất cả':
+        filtered_df = filtered_df[filtered_df['BIEN_DONG'] == selected_change_type]
+
+    if filtered_df.empty:
+        st.warning('Không có khách hàng phù hợp với bộ lọc đã chọn.')
+        return
+
+    st.metric('Tổng khách hàng', len(filtered_df))
+    st.metric('Tổng DELTA', f"{filtered_df['DELTA'].sum():,.0f}")
+    if 'TOTAL_T1' in filtered_df.columns:
+        st.metric('Tổng T1', f"{filtered_df['TOTAL_T1'].sum():,.0f}")
+    if 'TOTAL_T2' in filtered_df.columns:
+        st.metric('Tổng T2', f"{filtered_df['TOTAL_T2'].sum():,.0f}")
+
+    display_columns = [
+         'MA_CN','MA_KH', 'TEN_KH', 'CUST_TYPE_NAME', 'DP_TYPE_CODE',
+        'TOTAL_T1', 'TOTAL_T2', 'DELTA', 'BIEN_DONG', 'CHURN_SCORE', 'CHURN_RISK'
+    ]
+    display_columns = [col for col in display_columns if col in filtered_df.columns]
+    if not display_columns:
+        display_columns = filtered_df.columns.tolist()
+
+    st.subheader('Danh sách khách hàng')
+    st.dataframe(filtered_df[display_columns].sort_values(by='DELTA', ascending=True), use_container_width=True, height=420)
+
+    with st.expander('Top 10 khách hàng giảm mạnh nhất'): 
+        top_losers = filtered_df.nsmallest(10, 'DELTA') if 'DELTA' in filtered_df.columns else filtered_df.head(10)
+        st.table(top_losers[display_columns].head(10))
+
+    with st.expander('Top 10 khách hàng tăng mạnh nhất'):
+        top_winners = filtered_df.nlargest(10, 'DELTA') if 'DELTA' in filtered_df.columns else filtered_df.head(10)
+        st.table(top_winners[display_columns].head(10))
+
+    # Add Excel export functionality
+    if st.button('📊 Xuất Excel', key='export_customer_details', help='Xuất dữ liệu khách hàng ra file Excel'):
+        try:
+            # Create Excel export directly
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Export main customer data
+                filtered_df[display_columns].to_excel(writer, sheet_name='Chi tiết khách hàng', index=False)
+                
+                # Export top losers
+                top_losers[display_columns].head(10).to_excel(writer, sheet_name='Top giảm mạnh', index=False)
+                
+                # Export top winners  
+                top_winners[display_columns].head(10).to_excel(writer, sheet_name='Top tăng mạnh', index=False)
+                
+                # Export summary
+                summary_data = {
+                    'Metric': ['Tổng khách hàng', 'Tổng DELTA', 'Tổng T1', 'Tổng T2'],
+                    'Value': [
+                        len(filtered_df),
+                        filtered_df['DELTA'].sum() if 'DELTA' in filtered_df.columns else 0,
+                        filtered_df['TOTAL_T1'].sum() if 'TOTAL_T1' in filtered_df.columns else 0,
+                        filtered_df['TOTAL_T2'].sum() if 'TOTAL_T2' in filtered_df.columns else 0,
+                    ]
+                }
+                pd.DataFrame(summary_data).to_excel(writer, sheet_name='Tóm tắt', index=False)
+            
+            excel_data = output.getvalue()
+            st.download_button(
+                label="📥 Tải file Excel",
+                data=excel_data,
+                file_name=f"customer_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key='download_customer_excel'
+            )
+        except Exception as e:
+            st.error(f'Lỗi xuất Excel: {e}')
+
+
+def tab_branch_summary(data: Dict) -> None:
+    """Display branch-level summary."""
+    st.header('🏢 Tóm tắt theo Chi nhánh')
+    
+    summary_branch = data.get('summary_branch', pd.DataFrame())
+    if summary_branch.empty:
+        st.info('Chưa có dữ liệu tóm tắt chi nhánh.')
+        return
+    
+    # Key metrics
+    total_branches = len(summary_branch)
+    total_delta = summary_branch['TONG_DELTA'].sum() if 'TONG_DELTA' in summary_branch.columns else 0
+    total_t1 = summary_branch['TONG_T1'].sum() if 'TONG_T1' in summary_branch.columns else 0
+    total_t2 = summary_branch['TONG_T2'].sum() if 'TONG_T2' in summary_branch.columns else 0
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric('Tổng chi nhánh', total_branches)
+    col2.metric('Tổng DELTA', f'{total_delta:,.0f}')
+    col3.metric('Tổng T1', f'{total_t1:,.0f}')
+    col4.metric('Tổng T2', f'{total_t2:,.0f}')
+    
+    # Branch table
+    display_cols = ['MA_CN', 'SO_KH', 'TONG_T1', 'TONG_T2', 'TONG_DELTA', 'TY_LE_TANG_TRUONG']
+    display_cols = [col for col in display_cols if col in summary_branch.columns]
+    
+    st.subheader('Chi tiết từng chi nhánh')
+    st.dataframe(summary_branch[display_cols].sort_values('TONG_DELTA', ascending=False), use_container_width=True)
+    
+    # Charts
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if 'TONG_DELTA' in summary_branch.columns:
+            fig_delta = px.bar(
+                summary_branch.sort_values('TONG_DELTA', ascending=False).head(15),
+                x='MA_CN',
+                y='TONG_DELTA',
+                title='DELTA theo chi nhánh',
+                color='TONG_DELTA',
+                color_continuous_scale='RdYlGn'
+            )
+            st.plotly_chart(fig_delta, use_container_width=True)
+    
+    with col2:
+        if 'TY_LE_TANG_TRUONG' in summary_branch.columns:
+            fig_growth = px.bar(
+                summary_branch.sort_values('TY_LE_TANG_TRUONG', ascending=False).head(15),
+                x='MA_CN',
+                y='TY_LE_TANG_TRUONG',
+                title='Tỷ lệ tăng trưởng (%)',
+                color='TY_LE_TANG_TRUONG',
+                color_continuous_scale='RdYlGn'
+            )
+            st.plotly_chart(fig_growth, use_container_width=True)
+
+
+def tab_customer_type_summary(data: Dict) -> None:
+    """Display customer type summary."""
+    st.header('👥 Tóm tắt theo Phân khúc KH')
+    
+    summary_cust_type = data.get('summary_customer_type', pd.DataFrame())
+    if summary_cust_type.empty:
+        st.info('Chưa có dữ liệu tóm tắt phân khúc khách hàng.')
+        return
+    
+    display_cols = ['CUST_TYPE_NAME', 'SO_KH', 'TONG_T1', 'TONG_T2', 'TONG_DELTA']
+    display_cols = [col for col in display_cols if col in summary_cust_type.columns]
+    
+    st.dataframe(summary_cust_type[display_cols].sort_values('TONG_DELTA', ascending=False), use_container_width=True)
+
+
+def tab_segment_analysis(data: Dict) -> None:
+    """Display segment analysis."""
+    st.header('📊 Phân tích theo Segment')
+    
+    segment_summary = data.get('segment_summary', pd.DataFrame())
+    if segment_summary.empty:
+        st.info('Chưa có dữ liệu phân tích segment.')
+        return
+    
+    display_cols = ['BALANCE_BUCKET', 'SO_KH', 'TONG_T1', 'TONG_T2', 'TONG_DELTA', 'TY_LE_TANG_TRUONG']
+    display_cols = [col for col in display_cols if col in segment_summary.columns]
+    
+    st.dataframe(segment_summary[display_cols], use_container_width=True)
+
+
+def tab_product_summary(data: Dict) -> None:
+    """Display product summary."""
+    st.header('💳 Tóm tắt theo Sản phẩm')
+    
+    summary_product = data.get('summary_product', pd.DataFrame())
+    if summary_product.empty:
+        st.info('Chưa có dữ liệu tóm tắt sản phẩm.')
+        return
+    
+    display_cols = ['DP_TYPE_CODE', 'SO_KH', 'TONG_T1', 'TONG_T2', 'TONG_DELTA']
+    display_cols = [col for col in display_cols if col in summary_product.columns]
+    
+    st.dataframe(summary_product[display_cols].sort_values('TONG_DELTA', ascending=False), use_container_width=True)
+
+
+def tab_top_customers(data: Dict) -> None:
+    """Display top customers analysis."""
+    st.header('⭐ Top Khách hàng')
+    
+    comparison_df = data.get('comparison', pd.DataFrame())
+    if comparison_df.empty:
+        st.info('Chưa có dữ liệu khách hàng.')
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader('Top 10 khách hàng có số dư cao nhất')
+        if 'TOTAL_T2' in comparison_df.columns:
+            top_balance = comparison_df.nlargest(10, 'TOTAL_T2')
+            display_cols = ['MA_KH', 'TEN_KH', 'MA_CN', 'TOTAL_T2', 'DELTA']
+            display_cols = [col for col in display_cols if col in top_balance.columns]
+            st.table(top_balance[display_cols])
+    
+    with col2:
+        st.subheader('Top 10 khách hàng tăng trưởng mạnh nhất')
+        if 'DELTA' in comparison_df.columns:
+            top_growth = comparison_df.nlargest(10, 'DELTA')
+            display_cols = ['MA_KH', 'TEN_KH', 'MA_CN', 'DELTA', 'TOTAL_T2']
+            display_cols = [col for col in display_cols if col in top_growth.columns]
+            st.table(top_growth[display_cols])
+
+
+def tab_predictive_analytics(data):
+    """Display predictive analytics section."""
+    st.header('🔮 Dự Báo & Phân Tích Tiên Đoán')
+
+    prediction = data.get('prediction', pd.DataFrame())
+    if prediction.empty:
+        placeholder = st.container(key='info_no_forecast')
+        placeholder.info('Chưa có dữ liệu dự báo để hiển thị. Vui lòng chạy so sánh trước.')
+        return
+
+    prediction = normalize_forecast_columns(prediction)
+
+    st.markdown(
+        'Dự báo này sử dụng mô hình momentum đơn giản trên T1 và T2 để ước lượng kỳ tiếp theo. ' \
+        'Hiển thị luôn kịch bản cơ sở, lạc quan và thận trọng để ưu tiên hành động.'
+    )
+
+    cards = [
+        {'title': 'Chi nhánh nguy cơ giảm', 'value': len(prediction[prediction['FORECAST_DIRECTION'] == 'GIẢM']) if 'FORECAST_DIRECTION' in prediction.columns else 0},
+        {'title': 'Chi nhánh cơ hội tăng', 'value': len(prediction[prediction['FORECAST_DIRECTION'] == 'TĂNG']) if 'FORECAST_DIRECTION' in prediction.columns else 0},
+        {'title': 'Độ tin cậy cao', 'value': len(prediction[prediction['CONFIDENCE'] == 'Cao']) if 'CONFIDENCE' in prediction.columns else 0},
+    ]
+    cols = st.columns(len(cards))
+    for col, card in zip(cols, cards):
+        col.metric(card['title'], card['value'])
+
+    st.subheader('Dự báo chi nhánh theo kịch bản')
+    display_df = prediction.copy()
+    display_df = display_df[['MA_CN', 'TONG_T1', 'TONG_T2', 'PREDICT_T3_BASE', 'BASE_DELTA', 'PREDICT_T3_OPT', 'OPT_DELTA', 'PREDICT_T3_PESS', 'PESS_DELTA', 'CONFIDENCE', 'FORECAST_DIRECTION', 'RISK_NOTE']]
+    display_df = display_df.rename(columns={
+        'PREDICT_T3_BASE': 'DỰ_BÁO_T3_CS',
+        'BASE_DELTA': 'Δ_CS',
+        'PREDICT_T3_OPT': 'DỰ_BÁO_T3_TỐT',
+        'OPT_DELTA': 'Δ_Tốt',
+        'PREDICT_T3_PESS': 'DỰ_BÁO_T3_XẤU',
+        'PESS_DELTA': 'Δ_Xấu',
+    })
+    st.dataframe(display_df, use_container_width=True, height=380)
+
+    if not prediction.empty:
+        st.subheader('Top 5 chi nhánh cần chú ý')
+        risk_branches = prediction.sort_values('BASE_DELTA').head(5).copy()
+        opp_branches = prediction.sort_values('BASE_DELTA', ascending=False).head(5).copy()
+
+        risk_branches = risk_branches.rename(columns={
+            'PREDICT_T3_BASE': 'DỰ_BÁO_T3_CS',
+            'BASE_DELTA': 'Δ_CS',
+        })
+        opp_branches = opp_branches.rename(columns={
+            'PREDICT_T3_BASE': 'DỰ_BÁO_T3_CS',
+            'BASE_DELTA': 'Δ_CS',
+        })
+
+        with st.expander('Chi nhánh giảm mạnh nhất'):
+            st.table(risk_branches[['MA_CN', 'TONG_T2', 'DỰ_BÁO_T3_CS', 'Δ_CS', 'CONFIDENCE']])
+        with st.expander('Chi nhánh tăng tốt nhất'):
+            st.table(opp_branches[['MA_CN', 'TONG_T2', 'DỰ_BÁO_T3_CS', 'Δ_CS', 'CONFIDENCE']])
+
+    st.subheader('Biểu đồ xu hướng T1 → T2 → T3')
+    forecast_chart = prediction[['MA_CN', 'TONG_T1', 'TONG_T2', 'PREDICT_T3_BASE']].copy()
+    top_chart = forecast_chart.sort_values('PREDICT_T3_BASE', ascending=False).head(5)
+    if not top_chart.empty:
+        chart_long = top_chart.melt(id_vars=['MA_CN'], value_vars=['TONG_T1', 'TONG_T2', 'PREDICT_T3_BASE'], var_name='Giai đoạn', value_name='Giá trị')
+        fig = px.line(chart_long, x='Giai đoạn', y='Giá trị', color='MA_CN', markers=True,
+                      title='Xu hướng chi nhánh hàng đầu theo dự báo')
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.success('Dự báo này chỉ mang tính tham khảo. Nên dùng làm căn cứ để phân tích thêm và thảo luận chiến lược.')
+
+
+def tab_ai_insights(data):
+    """Display AI-style insights."""
+    st.header('💡 AI-Powered Insights')
+
+    insights = data.get('ai_insights', [])
+    if not insights:
+        placeholder = st.container(key='info_no_ai_insights')
+        placeholder.info('Chưa có insights AI vì dữ liệu chưa đủ.')
+        return
+
+    strategy_cards = extract_action_insight_cards(data)
+    if strategy_cards:
+        st.subheader('Tóm tắt nhanh')
+        cols = st.columns(len(strategy_cards))
+        for col, card in zip(cols, strategy_cards):
+            if card['type'] == 'action':
+                col.warning(f"**{card['title']}**\n{card['message']}")
+            else:
+                col.info(f"**{card['title']}**\n{card['message']}")
+
+    st.subheader('Những điểm đáng chú ý')
+    for idx, insight in enumerate(insights, start=1):
+        st.markdown(f"**{idx}.** {insight}")
+
+    if data.get('prediction', pd.DataFrame()).empty and data.get('alert_summary', pd.DataFrame()).empty:
+        placeholder = st.container(key='info_insights_more')
+        placeholder.info('Nếu muốn insights sâu hơn, hãy chạy dữ liệu với ít nhất một lần so sánh thành công.')
+
+
+def tab_alerts(data: Dict) -> None:
+    """Display alerts and warnings."""
+    st.header('🚨 Cảnh Báo')
+    
+    alert_summary = data.get('alert_summary', pd.DataFrame())
+    if alert_summary.empty:
+        st.info('Không có cảnh báo nào.')
+        return
+    
+    # Alert summary metrics
+    total_alerts = len(alert_summary)
+    high_priority = len(alert_summary[alert_summary['MUC_UU_TIEN'] == 'CAO']) if 'MUC_UU_TIEN' in alert_summary.columns else 0
+    
+    col1, col2 = st.columns(2)
+    col1.metric('Tổng cảnh báo', total_alerts)
+    col2.metric('Ưu tiên cao', high_priority)
+    
+    # Display alerts
+    if not alert_summary.empty and 'MUC_UU_TIEN' in alert_summary.columns:
+        display_cols = ['MA_KH', 'TEN_KH', 'MA_CN', 'CANH_BAO', 'MUC_UU_TIEN', 'LY_DO']
+        display_cols = [col for col in display_cols if col in alert_summary.columns]
+        
+        st.subheader('Danh sách cảnh báo')
+        st.dataframe(alert_summary[display_cols].sort_values('MUC_UU_TIEN', ascending=False), use_container_width=True)
+    elif not alert_summary.empty:
+        st.info('Chưa có dữ liệu cảnh báo.')
+
+
+def tab_outliers(data: Dict) -> None:
+    """Display outlier analysis."""
+    st.header('📈 Phân Tích Outliers')
+    
+    outliers = data.get('outliers', pd.DataFrame())
+    if outliers.empty:
+        st.info('Không có outliers được phát hiện.')
+        return
+    
+    st.metric('Số outliers', len(outliers))
+    
+    display_cols = ['MA_KH', 'TEN_KH', 'MA_CN', 'TOTAL_T1', 'TOTAL_T2', 'DELTA', 'BIEN_DONG', 'OUTLIER_TYPE']
+    display_cols = [col for col in display_cols if col in outliers.columns]
+    
+    st.dataframe(outliers[display_cols], use_container_width=True)
+
+
+def tab_action_recommendations(data: Dict) -> None:
+    """Display action recommendations."""
+    st.header('🎯 Khuyến Nghị Hành Động')
+    
+    recommendations = data.get('recommendations', pd.DataFrame())
+    if recommendations.empty:
+        st.info('Không có khuyến nghị nào.')
+        return
+    
+    # Recommendation summary
+    if 'MUC_UU_TIEN' in recommendations.columns:
+        priority_counts = recommendations['MUC_UU_TIEN'].value_counts()
+        
+        st.subheader('Tóm tắt khuyến nghị')
+        cols = st.columns(len(priority_counts))
+        for col, (priority, count) in zip(cols, priority_counts.items()):
+            col.metric(f'Ưu tiên {priority}', count)
+        
+        # Display recommendations
+        display_cols = ['MA_CN', 'KHuyen_nghi', 'MUC_UU_TIEN', 'LY_DO', 'Hanh_dong_de_xuat']
+        display_cols = [col for col in display_cols if col in recommendations.columns]
+        
+        st.subheader('Chi tiết khuyến nghị')
+        st.dataframe(recommendations[display_cols].sort_values('MUC_UU_TIEN', ascending=False), use_container_width=True)
+    else:
+        st.info('Chưa có cột ưu tiên trong dữ liệu khuyến nghị.')
+
+
+def tab_driver_analysis(data: Dict) -> None:
+    """Display driver analysis."""
+    st.header('🔍 Phân Tích Nguyên Nhân')
+    
+    driver_analysis = data.get('driver_analysis', {})
+    if not driver_analysis:
+        st.info('Chưa có phân tích nguyên nhân.')
+        return
+    
+    # Display key drivers
+    if 'customer_drivers' in driver_analysis:
+        st.subheader('Nguyên nhân từ khách hàng')
+        for driver in driver_analysis['customer_drivers']:
+            st.write(f"• {driver}")
+    
+    if 'product_drivers' in driver_analysis:
+        st.subheader('Nguyên nhân từ sản phẩm')
+        for driver in driver_analysis['product_drivers']:
+            st.write(f"• {driver}")
+    
+    if 'market_drivers' in driver_analysis:
+        st.subheader('Nguyên nhân từ thị trường')
+        for driver in driver_analysis['market_drivers']:
+            st.write(f"• {driver}")
+
+
+def tab_custom_report_builder(data):
+    """Allow user to build a custom report with selected sections."""
+    st.header('🛠️ Tạo Báo Cáo Tùy Chỉnh')
+
+    sections = [
+        'Dashboard',
+        'Executive summary',
+        'Customer details',
+        'Branch summary',
+        'Customer type',
+        'Product summary',
+        'Segment analysis',
+        'Market context',
+        'Capital strategy',
+        'Alerts',
+        'Recommendations',
+        'Predictive',
+        'AI Insights',
+        'Charts'
+    ]
+    selected_sections = st.multiselect(
+        'Chọn các phần muốn bao gồm trong báo cáo:',
+        sections,
+        default=['Dashboard', 'Executive summary', 'Customer details', 'Branch summary', 'Alerts']
+    )
+
+    if not selected_sections:
+        st.warning('Vui lòng chọn ít nhất một phần báo cáo.');
+        return
+
+    st.markdown('Bạn có thể tải báo cáo Excel chỉ chứa các bảng/section đã chọn.')
+    if st.button('📥 Xuất Báo Cáo Tùy Chỉnh', use_container_width=True):
+        try:
+            excel_data = export_custom_report_to_excel(data, selected_sections)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'BaoCao_TuyChinh_{timestamp}.xlsx'
+            st.download_button(
+                label='💾 Tải xuống báo cáo tùy chỉnh',
+                data=excel_data,
+                file_name=filename,
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f'❌ Lỗi tạo báo cáo tùy chỉnh: {e}')
+
+    st.divider()
+    st.subheader('Preview nội dung đã chọn')
+    for section in selected_sections:
+        st.markdown(f'- {section}')
+
+
+def complete_warehouse_processed_data(comparison_data: Dict) -> Dict:
+    """Build the dashboard analysis payload from warehouse comparison output."""
+    comparison_df = comparison_data.get('comparison', pd.DataFrame())
+    all_raw_data = comparison_data.get('all_raw_data', {})
+
+    if not comparison_df.empty:
+        comparison_df = comparison_df.copy()
         comparison_df['CHURN_SCORE'] = comparison_df.apply(calculate_risk_score, axis=1)
 
-    # Generate summaries
     summary_branch_data = summary_by_branch(comparison_df)
     summary_cust_type = summary_by_customer_type(comparison_df)
     summary_product = summary_by_product_group(all_raw_data)
     summary_change = summary_by_change_type(comparison_df)
 
-    # Build analysis and recommendations
     recommendations_df, recommendation_thresholds = build_action_recommendations(comparison_df)
     driver_customer = build_driver_table(summary_cust_type, 'CUST_TYPE_NAME', 'PHAN_KHUC')
     driver_product = build_driver_table(summary_product, 'DP_GROUP', 'SAN_PHAM')
@@ -1204,6 +1936,23 @@ def process_data(t1_paths, t2_paths, validation, column_mapping=None):
     alert_summary = build_alert_summary(summary_branch_data, summary_change, outliers, segment_summary, recommendations_df)
     trend_summary = build_change_type_trends(comparison_df)
     top_customers = build_top_customers(comparison_df, limit=20)
+    prediction = build_predictive_forecast(summary_branch_data)
+
+    base_payload = {
+        'comparison': comparison_df,
+        'summary_branch': summary_branch_data,
+        'summary_product': summary_product,
+        'segment_summary': segment_summary,
+    }
+    market_context = build_market_context({**base_payload, 'customer_data': all_raw_data})
+    capital_strategy = build_capital_strategy(base_payload)
+    ai_insights = build_ai_insights({
+        'comparison': comparison_df,
+        'summary_branch': summary_branch_data,
+        'alert_summary': alert_summary,
+        'top_customers': top_customers,
+        'prediction': prediction,
+    })
 
     return {
         'comparison': comparison_df,
@@ -1222,835 +1971,568 @@ def process_data(t1_paths, t2_paths, validation, column_mapping=None):
         'top_customers': top_customers,
         'outliers': outliers,
         'all_raw_data': all_raw_data,
-        'validation': st.session_state.validation_result
+        'prediction': prediction,
+        'ai_insights': ai_insights,
+        'market_context': market_context,
+        'capital_strategy': capital_strategy,
     }
 
 
-def tab_customer_details(data):
-    """Display detailed customer information."""
-    st.header("📋 Chi Tiết Khách Hàng")
-    
-    comparison_df = data['comparison']
-    
-    # Filters
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        selected_branches = st.multiselect(
-            "Chi Nhánh",
-            comparison_df['MA_CN'].unique(),
-            default=comparison_df['MA_CN'].unique(),
-            key="branch_filter"
+def render_summary_metrics(data: Dict) -> None:
+    """Render dashboard metric strip."""
+    comparison_df = data.get('comparison', pd.DataFrame())
+    branch_count = len(data.get('summary_branch', pd.DataFrame()))
+    total_delta = float(comparison_df['DELTA'].sum()) if not comparison_df.empty else 0
+    total_t1 = float(comparison_df['TOTAL_T1'].sum()) if not comparison_df.empty else 0
+    alert_count = len(data.get('alert_summary', pd.DataFrame()))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric('Chi nhánh', branch_count)
+    col2.metric('Khách hàng', len(comparison_df))
+    col3.metric('Mở mới', int((comparison_df['BIEN_DONG'] == 'MO_MOI').sum()) if not comparison_df.empty else 0)
+    col4.metric('Tất toán', int((comparison_df['BIEN_DONG'] == 'TAT_TOAN').sum()) if not comparison_df.empty else 0)
+    col5.metric('Tổng DELTA', f'{total_delta:,.0f}')
+
+    col6, col7, col8 = st.columns(3)
+    col6.metric('Cảnh báo', alert_count)
+    col7.metric('Tăng trưởng', f'{(total_delta / max(total_t1, 1) * 100):.2f}%')
+    col8.metric('Số dư T2', f"{float(comparison_df['TOTAL_T2'].sum()) if not comparison_df.empty else 0:,.0f}")
+
+
+def render_compare_workspace():
+    """Render comparison workflow in the main content area."""
+    st.header('So sánh dữ liệu')
+    st.caption('Chọn ngày dữ liệu T1/T2 từ kho. Có thể chọn 1 hoặc nhiều file để so sánh cùng lúc.')
+
+    warehouse_files = list_warehouse_files()
+    if warehouse_files.empty:
+        st.warning('Kho dữ liệu đang trống. Hãy import file trong màn Kho dữ liệu trước.')
+        return
+
+    warehouse_files['data_date'] = pd.to_datetime(warehouse_files['data_date'], errors='coerce')
+    warehouse_files['import_date'] = pd.to_datetime(warehouse_files['import_date'], errors='coerce')
+    dated_files = warehouse_files.dropna(subset=['data_date']).copy()
+    dated_files = filter_files_by_branch_access(dated_files)
+    if dated_files.empty:
+        st.warning('Chưa có file hợp lệ trong phạm vi chi nhánh được cấp quyền.')
+        return
+
+    dated_files['date_only'] = dated_files['data_date'].dt.date
+    available_dates = sorted(dated_files['date_only'].unique(), reverse=True)
+
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        t1_date = st.selectbox(
+            'T1 - ngày dữ liệu cũ',
+            options=available_dates,
+            index=1 if len(available_dates) > 1 else 0,
+            format_func=lambda d: d.strftime('%d/%m/%Y'),
+            key='dashboard_t1_data_date',
         )
-    
-    with col2:
-        selected_types = st.multiselect(
-            "Phân Khúc",
-            comparison_df['CUST_TYPE_NAME'].unique(),
-            default=comparison_df['CUST_TYPE_NAME'].unique(),
-            key="type_filter"
+    with col_t2:
+        t2_date = st.selectbox(
+            'T2 - ngày dữ liệu mới',
+            options=available_dates,
+            index=0,
+            format_func=lambda d: d.strftime('%d/%m/%Y'),
+            key='dashboard_t2_data_date',
         )
-    
-    with col3:
-        selected_changes = st.multiselect(
-            "Biến Động",
-            comparison_df['BIEN_DONG'].unique(),
-            default=comparison_df['BIEN_DONG'].unique(),
-            key="change_filter"
+
+    def latest_per_branch(df: pd.DataFrame) -> pd.DataFrame:
+        return (
+            df.sort_values('import_date', ascending=False)
+            .drop_duplicates(subset=['branch_code'], keep='first')
+            .sort_values('branch_code')
         )
-    
-    # Apply filters
-    filtered_df = comparison_df[
-        (comparison_df['MA_CN'].isin(selected_branches)) &
-        (comparison_df['CUST_TYPE_NAME'].isin(selected_types)) &
-        (comparison_df['BIEN_DONG'].isin(selected_changes))
-    ].copy()
-    
-    # Format for display
-    display_df = filtered_df.copy()
-    for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA']:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
-    
-    st.dataframe(display_df, use_container_width=True, height=400)
-    
-    # Statistics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Tổng Khách Hàng", len(filtered_df))
-    with col2:
-        st.metric("Mở Mới", len(filtered_df[filtered_df['BIEN_DONG'] == 'MO_MOI']))
-    with col3:
-        st.metric("Tất Toán", len(filtered_df[filtered_df['BIEN_DONG'] == 'TAT_TOAN']))
-    with col4:
-        st.metric("Tăng", len(filtered_df[filtered_df['BIEN_DONG'] == 'TANG']))
-    
-    # Export filtered data to Excel
-    if not filtered_df.empty:
-        st.markdown("---")
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            if st.button("📥 Xuất Excel (Dữ Liệu Đã Lọc)", use_container_width=True, key="export_filtered"):
-                try:
-                    # Create fast Excel export
-                    export_df = filtered_df.copy()
-                    # Format numeric columns
-                    for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA']:
-                        if col in export_df.columns:
-                            export_df[col] = export_df[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "0")
-                    
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        export_df.to_excel(writer, sheet_name='Khách Hàng Đã Lọc', index=False)
-                        
-                        ws = writer.sheets['Khách Hàng Đã Lọc']
-                        from openpyxl.styles import Font, PatternFill
-                        from openpyxl.utils import get_column_letter
-                        
-                        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-                        header_font = Font(bold=True, color="FFFFFF")
-                        
-                        for cell in ws[1]:
-                            cell.fill = header_fill
-                            cell.font = header_font
-                        
-                        for col_num in range(1, len(export_df.columns) + 1):
-                            ws.column_dimensions[get_column_letter(col_num)].width = 15
-                    
-                    output.seek(0)
-                    excel_data = output.getvalue()
-                    
-                    # Generate filename with timestamp
-                    from datetime import datetime
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"ChiTietKhachHang_Loc_{timestamp}.xlsx"
-                    
-                    st.download_button(
-                        label="💾 Tải Xuống Excel",
-                        data=excel_data,
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml"
-                    )
-                    
-                    st.success(f"✅ Đã chuẩn bị file Excel: {filename}")
-                    
-                except Exception as e:
-                    st.error(f"❌ Lỗi xuất Excel: {str(e)}")
+
+    t1_files = dated_files[dated_files['date_only'] == t1_date].sort_values(['branch_code', 'import_date'], ascending=[True, False])
+    t2_files = dated_files[dated_files['date_only'] == t2_date].sort_values(['branch_code', 'import_date'], ascending=[True, False])
+
+    st.subheader('Chọn file T1 / T2 để so sánh')
+    t1_label_map = {
+        row['id']: f"{row['original_name']} ({row['branch_code']} - {row['record_count']} rec)"
+        for _, row in t1_files.iterrows()
+    }
+    t2_label_map = {
+        row['id']: f"{row['original_name']} ({row['branch_code']} - {row['record_count']} rec)"
+        for _, row in t2_files.iterrows()
+    }
+
+    t1_selected = st.multiselect(
+        'Chọn file T1:',
+        options=t1_files['id'].tolist(),
+        default=t1_files['id'].tolist(),
+        format_func=lambda x: t1_label_map.get(x, str(x)),
+        key='dashboard_t1_file_selection'
+    )
+
+    if t1_selected:
+        suggestions = suggest_file_pairs(t1_selected, t2_files)
+        if suggestions:
+            st.caption('💡 Gợi ý T2 cho các file T1 đã chọn.')
+            if st.button('💡 Áp dụng gợi ý T2', key='dashboard_apply_t2_suggestions'):
+                st.session_state.dashboard_t2_file_selection = list(suggestions.values())
+
+    t2_selected = st.multiselect(
+        'Chọn file T2:',
+        options=t2_files['id'].tolist(),
+        default=t2_files['id'].tolist(),
+        format_func=lambda x: t2_label_map.get(x, str(x)),
+        key='dashboard_t2_file_selection'
+    )
+
+    t1_selected_files = t1_files[t1_files['id'].isin(t1_selected)]
+    t2_selected_files = t2_files[t2_files['id'].isin(t2_selected)]
+
+    st.subheader('Kiểm tra chi nhánh')
+    t1_branch_set = set(t1_selected_files['branch_code'].dropna())
+    t2_branch_set = set(t2_selected_files['branch_code'].dropna())
+    all_branches = sorted(t1_branch_set | t2_branch_set)
+    branch_check = pd.DataFrame([
+        {
+            'MA_CN': branch,
+            'T1': 'Có' if branch in t1_branch_set else 'Thiếu',
+            'T2': 'Có' if branch in t2_branch_set else 'Thiếu',
+            'Trạng thái': 'OK' if branch in t1_branch_set and branch in t2_branch_set else 'Lệch',
+        }
+        for branch in all_branches
+    ])
+    st.dataframe(branch_check, use_container_width=True, hide_index=True)
+
+    valid_pair = bool(t1_selected and t2_selected and t1_date != t2_date)
+    status_label = 'Hợp lệ' if valid_pair else 'Chưa hợp lệ'
+    if t1_selected and t2_selected and t1_date == t2_date:
+        status_label = 'T1 và T2 không thể cùng ngày'
+
+    col_status, col_run = st.columns([0.7, 0.3])
+    with col_status:
+        st.write(
+            f"T1: {len(t1_selected)} file | T2: {len(t2_selected)} file | Trạng thái: {status_label}"
+        )
+    with col_run:
+        compare_clicked = st.button('So sánh dữ liệu', disabled=not valid_pair, type='primary', use_container_width=True)
+
+    if compare_clicked:
+        try:
+            progress = st.progress(0)
+            status = st.empty()
+            status.text('Đang lấy dữ liệu từ kho...')
+            progress.progress(15)
+
+            comparison_data = build_comparison_from_warehouse(t1_selected, t2_selected, None)
+            cache_key = f"warehouse_{'_'.join(map(str, sorted(t1_selected)))}_vs_{'_'.join(map(str, sorted(t2_selected))) }"
+            cache_key_hash = hashlib.sha256(cache_key.encode()).hexdigest()
+
+            status.text('Đang xử lý đối chiếu...')
+            progress.progress(45)
+            cached = load_processed_data(cache_key_hash)
+            if cached and 'comparison' in cached:
+                processed = cached
+                cache_hit = 'YES'
+            else:
+                processed = complete_warehouse_processed_data(comparison_data)
+                cache_hit = 'NO'
+
+            status.text('Đang lưu kết quả...')
+            progress.progress(85)
+            st.session_state.processed_data = processed
+            if cache_hit == 'NO':
+                save_processed_data(cache_key_hash, processed)
+
+            comparison_df = processed['comparison']
+            append_history({
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'cache_key': cache_key_hash,
+                't1_input_files': ';'.join(t1_selected_files['original_name'].tolist()),
+                't2_input_files': ';'.join(t2_selected_files['original_name'].tolist()),
+                't1_files': len(t1_selected),
+                't2_files': len(t2_selected),
+                't1_date': t1_date.strftime('%Y-%m-%d'),
+                't2_date': t2_date.strftime('%Y-%m-%d'),
+                'branches': len(processed['summary_branch']),
+                'customers': len(comparison_df),
+                'total_t1': round(float(comparison_df['TOTAL_T1'].sum()), 2) if not comparison_df.empty else 0,
+                'total_t2': round(float(comparison_df['TOTAL_T2'].sum()), 2) if not comparison_df.empty else 0,
+                'total_delta': round(float(comparison_df['DELTA'].sum()), 2) if not comparison_df.empty else 0,
+                'high_risk_customers': len(processed['recommendations'][processed['recommendations']['MUC_UU_TIEN'] == 'RAT_CAO']) if not processed['recommendations'].empty and 'MUC_UU_TIEN' in processed['recommendations'].columns else 0,
+                'cache_hit': cache_hit,
+            })
+            log_audit(
+                'SYSTEM', 'RUN_COMPARISON', 'comparison', None, None,
+                f"Compared {t1_date.strftime('%Y-%m-%d')} vs {t2_date.strftime('%Y-%m-%d')} with {len(t1_selected)} branches"
+            )
+            progress.progress(100)
+            status.text('Hoàn tất')
+            st.success('So sánh thành công. Chuyển sang Dashboard hoặc Phân tích để xem kết quả.')
+        except Exception as e:
+            st.error(f'Lỗi xử lý so sánh: {e}')
 
 
-def tab_dashboard(data):
-    """Display the new dashboard view with KPI, alerts, and trends."""
-    st.header("📈 Dashboard Tổng Quan")
+def render_warehouse_workspace():
+    """Render warehouse management in main area."""
+    st.header('Kho dữ liệu')
+    tab_import, tab_dates, tab_files, tab_stats = st.tabs(['Import', 'Dữ liệu theo ngày', 'Danh sách file', 'Thống kê'])
+    with tab_import:
+        render_import_section()
+    with tab_dates:
+        render_calendar_view()
+    with tab_files:
+        render_enhanced_file_list()
+    with tab_stats:
+        render_statistics_section()
 
-    comparison_df = data['comparison']
-    trend_summary = data.get('trend_summary', pd.DataFrame())
-    alert_summary = data.get('alert_summary', pd.DataFrame())
-    last_run = get_last_run_metrics()
 
+def render_analysis_workspace(data: Optional[Dict]):
+    """Render analysis screens."""
+    st.header('Phân tích')
+    if not data:
+        placeholder = st.container(key='info_no_analysis_data')
+        placeholder.info('Chưa có dữ liệu phân tích. Hãy chạy so sánh trước.')
+        return
+
+    section = st.selectbox('Nhóm phân tích', ['Chi tiết', 'Dự báo', 'Insights AI', 'Cảnh báo', 'Khuyến nghị'])
+    if section == 'Chi tiết':
+        tab_customer_details(data)
+        st.divider()
+        tab_branch_summary(data)
+        st.divider()
+        tab_customer_type_summary(data)
+        st.divider()
+        tab_segment_analysis(data)
+        st.divider()
+        tab_product_summary(data)
+        st.divider()
+        tab_top_customers(data)
+    elif section == 'Dự báo':
+        tab_predictive_analytics(data)
+    elif section == 'Insights AI':
+        tab_ai_insights(data)
+    elif section == 'Cảnh báo':
+        tab_alerts(data)
+        st.divider()
+        tab_outliers(data)
+    elif section == 'Khuyến nghị':
+        tab_action_recommendations(data)
+        st.divider()
+        tab_driver_analysis(data)
+
+
+def render_report_workspace(data: Optional[Dict]):
+    """Render report/export screens."""
+    st.header('Báo cáo')
+    if not data:
+        placeholder = st.container(key='info_no_report_data')
+        placeholder.info('Chưa có dữ liệu báo cáo. Hãy chạy so sánh trước.')
+        return
+
+    section = st.selectbox('Loại báo cáo', ['Biểu đồ & Excel', 'Báo cáo tùy chỉnh', 'Chia sẻ'])
+    if section == 'Biểu đồ & Excel':
+        tab_charts(data)
+        st.divider()
+        tab_export(data)
+    elif section == 'Báo cáo tùy chỉnh':
+        tab_custom_report_builder(data)
+    elif section == 'Chia sẻ':
+        render_sharing_interface(data)
+
+
+def tab_charts(data: Dict) -> None:
+    """Display comprehensive charts for reporting."""
+    st.header('📊 Biểu đồ Báo cáo')
+    
+    comparison_df = data.get('comparison', pd.DataFrame())
+    summary_branch = data.get('summary_branch', pd.DataFrame())
+    
     if comparison_df.empty:
-        st.info("Chưa có dữ liệu để hiển thị dashboard.")
+        st.info('Chưa có dữ liệu để tạo biểu đồ.')
         return
-
-    total_customers = len(comparison_df)
-    total_delta = float(comparison_df['DELTA'].sum())
-    total_t1 = float(comparison_df['TOTAL_T1'].sum())
-    total_t2 = float(comparison_df['TOTAL_T2'].sum())
-    rate_growth = (total_delta / total_t1 * 100) if total_t1 != 0 else 0
-    new_customers = int((comparison_df['BIEN_DONG'] == 'MO_MOI').sum())
-    churn_customers = int((comparison_df['BIEN_DONG'] == 'TAT_TOAN').sum())
-    risk_customers = int((comparison_df['CHURN_SCORE'] >= 60).sum())
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric('Tổng khách hàng', total_customers)
-    with c2:
-        st.metric('Tổng T1', f"{total_t1:,.0f}")
-    with c3:
-        st.metric('Tổng T2', f"{total_t2:,.0f}")
-    with c4:
-        st.metric('Tăng trưởng', f"{rate_growth:.2f}%")
-
-    c5, c6, c7, c8 = st.columns(4)
-    with c5:
-        st.metric('Mới', new_customers)
-    with c6:
-        st.metric('Tất toán', churn_customers)
-    with c7:
-        st.metric('Rủi ro cao', risk_customers)
-    with c8:
-        st.metric('Cảnh báo', len(alert_summary))
-
-    if last_run:
-        diff_customers = last_run.get('delta_customers')
-        diff_total = last_run.get('delta_total')
-        with st.expander('🕘 So sánh với lần chạy trước', expanded=True):
-            st.write(f"Số lượng khách hiện tại: {total_customers} ({'+' if diff_customers >= 0 else ''}{diff_customers} so với lần trước)")
-            st.write(f"Tổng DELTA hiện tại: {total_delta:,.0f} ({'+' if diff_total >= 0 else ''}{diff_total:,.0f} so với lần trước)")
-
-    with st.expander('📌 Các cảnh báo chính', expanded=True):
-        if alert_summary.empty:
-            st.success('Không có cảnh báo cấp cao.')
-        else:
-            st.dataframe(alert_summary, use_container_width=True)
-
-    if not trend_summary.empty:
-        st.subheader('Xu hướng biến động theo loại')
-        fig = px.bar(
-            trend_summary,
-            x='BIEN_DONG',
-            y='SO_KH',
-            color='TONG_DELTA',
-            title='Phân bổ khách hàng theo nhóm biến động',
-            color_continuous_scale=['red', 'yellow', 'green'],
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader('Chi tiết nhóm biến động')
-    st.dataframe(trend_summary, use_container_width=True)
-
-
-def tab_segment_analysis(data):
-    """Display advanced segment analysis by balance bucket."""
-    st.header("🌐 Phân Khúc Nâng Cao")
-
-    segment_summary = data.get('segment_summary', pd.DataFrame())
-    if segment_summary.empty:
-        st.info('Chưa có dữ liệu phân khúc để phân tích.')
-        return
-
-    display_df = segment_summary.copy()
-    for col in ['TONG_T1', 'TONG_T2', 'TONG_DELTA', 'DIEM_RUI_RO_TRUNG_BINH', 'TY_LE_TANG_TRUONG']:
-        if col in display_df.columns:
-            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}" if x is not None and col != 'TY_LE_TANG_TRUONG' else f"{x:.2f}%" if x is not None else '0')
-
-    st.markdown(
-        'Phân tích theo phân khúc dư tiền T2, cho biết phân khúc nào đóng góp tăng/giảm và mức độ rủi ro trung bình.'
-    )
-    st.dataframe(display_df, use_container_width=True)
-
-    st.subheader('Biểu đồ phân khúc')
-    fig = px.bar(
-        segment_summary,
-        x='BALANCE_BUCKET',
-        y='TONG_DELTA',
-        color='TONG_DELTA',
-        title='Đóng góp DELTA theo phân khúc dư tiền',
-        color_continuous_scale=['red', 'yellow', 'green'],
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander('ℹ️ Gợi ý phân tích', expanded=False):
-        st.markdown(
-            """
-            - Các phân khúc có DELTA âm lớn cần xem lại chính sách chăm sóc và sản phẩm phù hợp.
-            - Phân khúc có điểm rủi ro trung bình cao cần ưu tiên giữ chân.
-            - Dùng bảng này để xác định nhóm khách hàng mục tiêu cho chương trình marketing.
-            """
-        )
-
-
-def tab_top_customers(data):
-    """Display top customers by gain, loss and balance."""
-    st.header("🏆 Khách Hàng Tiêu Biểu")
-
-    top_customers = data.get('top_customers', {})
-    top_gainers = top_customers.get('top_gainers', pd.DataFrame())
-    top_losers = top_customers.get('top_losers', pd.DataFrame())
-    top_value = top_customers.get('top_value', pd.DataFrame())
-
-    if top_gainers.empty and top_losers.empty and top_value.empty:
-        st.info('Chưa có dữ liệu khách hàng tiêu biểu.')
-        return
-
-    st.subheader('Top khách hàng tăng mạnh')
-    if not top_gainers.empty:
-        display_top = top_gainers.copy()
-        for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA']:
-            if col in display_top.columns:
-                display_top[col] = display_top[col].apply(lambda x: f"{x:,.0f}")
-        st.dataframe(display_top, use_container_width=True, height=260)
-
-    st.subheader('Top khách hàng giảm mạnh')
-    if not top_losers.empty:
-        display_losers = top_losers.copy()
-        for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA']:
-            if col in display_losers.columns:
-                display_losers[col] = display_losers[col].apply(lambda x: f"{x:,.0f}")
-        st.dataframe(display_losers, use_container_width=True, height=260)
-
-    st.subheader('Top khách hàng theo dư lớn nhất T2')
-    if not top_value.empty:
-        display_value = top_value.copy()
-        for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA']:
-            if col in display_value.columns:
-                display_value[col] = display_value[col].apply(lambda x: f"{x:,.0f}")
-        st.dataframe(display_value, use_container_width=True, height=260)
-
-
-def tab_alerts(data):
-    """Display alert summary and recommendations."""
-    st.header("⚠️ Cảnh Báo & Nhận Diện Rủi Ro")
-
-    alert_summary = data.get('alert_summary', pd.DataFrame())
-    if alert_summary.empty:
-        st.success('Không có cảnh báo cấp cao hiện tại.')
-        return
-
-    st.markdown(
-        'Danh sách cảnh báo được xây dựng dựa trên chi nhánh giảm mạnh, nhóm biến động âm lớn, outlier và rủi ro khách hàng.'
-    )
-    st.dataframe(alert_summary, use_container_width=True, height=380)
-
-    with st.expander('ℹ️ Cách đọc cảnh báo', expanded=False):
-        st.markdown(
-            """
-            - `Chi nhánh giảm mạnh`: xem chi nhánh có DELTA âm lớn.
-            - `Tốc độ tăng trưởng thấp`: cảnh báo chi nhánh có mức tăng trưởng dưới ngưỡng.
-            - `Phát hiện bất thường`: số lượng khách bất thường theo IQR.
-            - `Rủi ro khách hàng cao`: số khách hàng ưu tiên giữ chân ngay.
-            """
-        )
-
-
-def tab_branch_summary(data):
-    """Display summary by branch."""
-    st.header("📊 Thống Kê Theo Chi Nhánh")
     
-    st.info("📌 So sánh dữ liệu tiền gửi giữa T1 và T2 theo từng chi nhánh, bao gồm tỷ lệ tăng trưởng")
-    
-    summary_branch = data['summary_branch']
-    
-    # Format for display
-    display_df = summary_branch.copy()
-    for col in ['TONG_T1', 'TONG_T2', 'TONG_DELTA']:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
-    display_df['TY_LE_TANG_TRUONG'] = display_df['TY_LE_TANG_TRUONG'].apply(lambda x: f"{x:.2%}")
-    
-    st.dataframe(display_df, use_container_width=True)
-    
-    # Summary metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        total_t1 = summary_branch['TONG_T1'].sum()
-        st.metric("Tổng T1", f"{total_t1:,.0f}")
-    with col2:
-        total_t2 = summary_branch['TONG_T2'].sum()
-        st.metric("Tổng T2", f"{total_t2:,.0f}")
-    with col3:
-        total_delta = summary_branch['TONG_DELTA'].sum()
-        st.metric("Tổng DELTA", f"{total_delta:,.0f}")
-    
-    with st.expander("ℹ️ Giải Thích"):
-        st.markdown("""
-        **TONG_T1:** Tổng dư tiền của chi nhánh ở quý 1
-        **TONG_T2:** Tổng dư tiền của chi nhánh ở quý 2
-        **TONG_DELTA:** Chênh lệch (TONG_T2 - TONG_T1)
-        **TY_LE_TANG_TRUONG:** Tỷ lệ tăng (hay giảm) so với quý trước
-        """)
-
-
-def tab_customer_type_summary(data):
-    """Display summary by customer type."""
-    st.header("👥 Thống Kê Theo Phân Khúc")
-    
-    st.info("📌 Phân tích dữ liệu giữa khách hàng Cá Nhân và Pháp Nhân")
-    
-    summary_cust = data['summary_cust_type']
-    
-    # Format for display
-    display_df = summary_cust.copy()
-    for col in ['TONG_T1', 'TONG_T2', 'TONG_DELTA']:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
-    
-    st.dataframe(display_df, use_container_width=True)
-    
-    # Chart
-    if not summary_cust.empty:
-        fig = px.bar(
-            summary_cust,
-            x='CUST_TYPE_NAME',
-            y=['TONG_T1', 'TONG_T2'],
-            barmode='group',
-            title='So Sánh Giữa T1 và T2 Theo Phân Khúc'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def tab_product_summary(data):
-    """Display summary by product group."""
-    st.header("📦 Thống Kê Theo Nhóm Sản Phẩm")
-    
-    st.info("📌 Phân tích dữ liệu tiền gửi theo từng loại sản phẩm")
-    
-    summary_product = data['summary_product']
-    
-    # Format for display
-    display_df = summary_product.copy()
-    for col in ['TONG_T1', 'TONG_T2', 'TONG_DELTA']:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
-    
-    st.dataframe(display_df, use_container_width=True)
-    
-    # Chart
-    if not summary_product.empty:
-        fig = px.bar(
-            summary_product,
-            x='DP_GROUP',
-            y='TONG_DELTA',
-            title='Biến Động Theo Nhóm Sản Phẩm',
-            color='TONG_DELTA',
-            color_continuous_scale=['red', 'yellow', 'green']
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def tab_outliers(data):
-    """Display outliers."""
-    st.header("🚨 Phát Hiện Bất Thường")
-    
-    st.warning("""
-    ⚠️ **Bất Thường (Outlier)** là những giao dịch có chênh lệch bất thường so với trung bình.
-    Hệ thống sử dụng phương pháp **IQR (Interquartile Range)** để phát hiện.
-    """)
-    
-    outliers = data['outliers']
-    
-    if outliers.empty:
-        st.success("✅ Không phát hiện bất thường nào")
-    else:
-        # Display outliers
-        display_df = outliers.copy()
-        for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA']:
-            if col in display_df.columns:
-                display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
-        
-        cols_to_show = ['MA_CN', 'MA_KH', 'TEN_KH', 'CUST_TYPE_NAME', 'TOTAL_T1', 'TOTAL_T2', 'DELTA', 'BIEN_DONG']
-        display_df = display_df[[col for col in cols_to_show if col in display_df.columns]]
-        
-        st.dataframe(display_df, use_container_width=True, height=400)
-        
-        # Statistics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Tổng Bất Thường", len(outliers))
-        with col2:
-            positive = len(outliers[outliers['DELTA'] > 0])
-            st.metric("Tăng Bất Thường", positive)
-        with col3:
-            negative = len(outliers[outliers['DELTA'] < 0])
-            st.metric("Giảm Bất Thường", negative)
-
-
-def tab_action_recommendations(data):
-    """Display action recommendations for customer follow-up."""
-    st.header("🎯 Khuyến Nghị Hành Động")
-
-    recommendations_df = data.get('recommendations', pd.DataFrame())
-    thresholds = data.get('recommendation_thresholds', {})
-
-    if recommendations_df.empty:
-        st.info("Chưa phát sinh khuyến nghị hành động theo rule hiện tại.")
-        return
-
-    st.info(
-        "📌 Hệ thống tự xếp hạng theo mức ưu tiên và đưa ra hành động gợi ý dựa trên biến động tiền gửi."
-    )
-
-    with st.expander("ℹ️ Giải thích logic khuyến nghị", expanded=False):
-        st.markdown(
-            """
-            **1) Cách hệ thống xác định ngưỡng**
-            - `Ngưỡng giảm mạnh`: max(50 triệu, Q75 của |DELTA âm|)
-            - `Ngưỡng tăng mạnh`: max(50 triệu, Q75 của DELTA dương)
-            - `Ngưỡng mở mới lớn`: max(100 triệu, Q75 của TOTAL_T2 với khách `MO_MOI`)
-
-            **2) Quy tắc xếp mức ưu tiên**
-            - `RAT_CAO`: Khách tất toán hoặc giảm rất mạnh
-            - `CAO`: Khách giảm mạnh vượt ngưỡng
-            - `TRUNG_BINH`: Khách mở mới lớn hoặc tăng mạnh
-
-            **3) Ý nghĩa cột trong bảng**
-            - `LY_DO`: Lý do rule được kích hoạt
-            - `HANH_DONG_GOI_Y`: Gợi ý thao tác thực tế cho đội chăm sóc/kinh doanh
-            - `ABS_DELTA`: Độ lớn biến động tuyệt đối để ưu tiên xử lý
-            """
-        )
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Ngưỡng giảm mạnh", f"{thresholds.get('risk_threshold', 0):,.0f}")
-    with col2:
-        st.metric("Ngưỡng tăng mạnh", f"{thresholds.get('growth_threshold', 0):,.0f}")
-    with col3:
-        st.metric("Ngưỡng mở mới lớn", f"{thresholds.get('new_open_threshold', 0):,.0f}")
-
-    colf1, colf2 = st.columns(2)
-    with colf1:
-        selected_priorities = st.multiselect(
-            "Mức ưu tiên",
-            recommendations_df['MUC_UU_TIEN'].unique(),
-            default=list(recommendations_df['MUC_UU_TIEN'].unique()),
-            key='recommendation_priority_filter',
-        )
-    with colf2:
-        selected_branches = st.multiselect(
-            "Chi nhánh",
-            recommendations_df['MA_CN'].unique(),
-            default=list(recommendations_df['MA_CN'].unique()),
-            key='recommendation_branch_filter',
-        )
-
-    filtered_df = recommendations_df[
-        recommendations_df['MUC_UU_TIEN'].isin(selected_priorities)
-        & recommendations_df['MA_CN'].isin(selected_branches)
-    ].copy()
-
-    display_df = filtered_df.copy()
-    for col in ['TOTAL_T1', 'TOTAL_T2', 'DELTA', 'ABS_DELTA', 'DIEM_RUI_RO']:
-        if col in display_df.columns:
-            display_df[col] = display_df[col].apply(lambda value: f"{value:,.0f}") if col != 'DIEM_RUI_RO' else display_df[col].apply(lambda value: int(value) if pd.notna(value) else 0)
-
-    st.dataframe(display_df, use_container_width=True, height=420)
-
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("Số KH cần hành động", len(filtered_df))
-    with m2:
-        high_count = len(filtered_df[filtered_df['MUC_UU_TIEN'] == 'RAT_CAO'])
-        st.metric("Ưu tiên rất cao", high_count)
-    with m3:
-        risk_value = abs(filtered_df.loc[filtered_df['DELTA'] < 0, 'DELTA'].sum())
-        st.metric("Giá trị rủi ro", f"{risk_value:,.0f}")
-
-
-def tab_driver_analysis(data):
-    """Display driver analysis by customer segment and product group."""
-    st.header("🧭 Phân Tích Động Lực")
-
-    driver_customer = data.get('driver_customer', pd.DataFrame())
-    driver_product = data.get('driver_product', pd.DataFrame())
-
-    if driver_customer.empty and driver_product.empty:
-        st.info("Không có dữ liệu để phân tích động lực biến động.")
-        return
-
-    st.info(
-        "📌 Cho biết nhóm nào đang đóng góp chính vào tăng/giảm tổng DELTA, theo phân khúc khách hàng và sản phẩm."
-    )
-
-    with st.expander("ℹ️ Giải thích cách đọc phân tích động lực", expanded=False):
-        st.markdown(
-            """
-            **1) Các chỉ số chính**
-            - `TONG_DELTA`: Mức đóng góp ròng của từng nhóm
-            - `DONG_GOP_RONG_%`: Tỷ trọng đóng góp trên tổng DELTA ròng
-            - `DONG_GOP_ABS_%`: Tỷ trọng theo trị tuyệt đối (cho biết mức ảnh hưởng thật sự)
-            - `XU_HUONG`: `TANG`, `GIAM`, hoặc `TRUNG_TINH`
-
-            **2) Cách diễn giải nhanh**
-            - Nhóm có `TONG_DELTA` dương lớn: động lực tăng trưởng chính
-            - Nhóm có `TONG_DELTA` âm lớn (về độ lớn): nguyên nhân kéo giảm chính
-            - Ưu tiên nhóm có `DONG_GOP_ABS_%` cao để tác động hiệu quả hơn
-
-            **3) Lưu ý nghiệp vụ**
-            - `DONG_GOP_RONG_%` có thể vượt 100% khi các nhóm tăng và giảm triệt tiêu nhau
-            - Vì vậy nên xem đồng thời cả `DONG_GOP_RONG_%` và `DONG_GOP_ABS_%`
-            """
-        )
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.subheader("Theo phân khúc")
-        if driver_customer.empty:
-            st.caption("Không có dữ liệu phân khúc.")
-        else:
-            fig = px.bar(
-                driver_customer.sort_values('TONG_DELTA', ascending=False),
-                x='NHOM',
-                y='TONG_DELTA',
-                color='XU_HUONG',
-                title='Đóng góp DELTA theo phân khúc',
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            display_cust = driver_customer.copy()
-            display_cust['TONG_DELTA'] = display_cust['TONG_DELTA'].apply(lambda value: f"{value:,.0f}")
-            display_cust['DONG_GOP_RONG_%'] = display_cust['DONG_GOP_RONG_%'].apply(lambda value: f"{value:.2f}%")
-            display_cust['DONG_GOP_ABS_%'] = display_cust['DONG_GOP_ABS_%'].apply(lambda value: f"{value:.2f}%")
-            st.dataframe(display_cust, use_container_width=True)
-
-    with c2:
-        st.subheader("Theo sản phẩm")
-        if driver_product.empty:
-            st.caption("Không có dữ liệu sản phẩm.")
-        else:
-            fig = px.bar(
-                driver_product.sort_values('TONG_DELTA', ascending=False),
-                x='NHOM',
-                y='TONG_DELTA',
-                color='XU_HUONG',
-                title='Đóng góp DELTA theo sản phẩm',
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            display_product = driver_product.copy()
-            display_product['TONG_DELTA'] = display_product['TONG_DELTA'].apply(lambda value: f"{value:,.0f}")
-            display_product['DONG_GOP_RONG_%'] = display_product['DONG_GOP_RONG_%'].apply(lambda value: f"{value:.2f}%")
-            display_product['DONG_GOP_ABS_%'] = display_product['DONG_GOP_ABS_%'].apply(lambda value: f"{value:.2f}%")
-            st.dataframe(display_product, use_container_width=True)
-
-    insight_col1, insight_col2 = st.columns(2)
-    if not driver_customer.empty:
-        top_pos_cust = driver_customer.sort_values('TONG_DELTA', ascending=False).iloc[0]
-        top_neg_cust = driver_customer.sort_values('TONG_DELTA', ascending=True).iloc[0]
-        with insight_col1:
-            st.success(
-                f"Phân khúc đóng góp tăng mạnh nhất: {top_pos_cust['NHOM']} ({top_pos_cust['TONG_DELTA']:,.0f})"
-            )
-            st.warning(
-                f"Phân khúc kéo giảm mạnh nhất: {top_neg_cust['NHOM']} ({top_neg_cust['TONG_DELTA']:,.0f})"
-            )
-
-    if not driver_product.empty:
-        top_pos_prod = driver_product.sort_values('TONG_DELTA', ascending=False).iloc[0]
-        top_neg_prod = driver_product.sort_values('TONG_DELTA', ascending=True).iloc[0]
-        with insight_col2:
-            st.success(
-                f"Sản phẩm đóng góp tăng mạnh nhất: {top_pos_prod['NHOM']} ({top_pos_prod['TONG_DELTA']:,.0f})"
-            )
-            st.warning(
-                f"Sản phẩm kéo giảm mạnh nhất: {top_neg_prod['NHOM']} ({top_neg_prod['TONG_DELTA']:,.0f})"
-            )
-
-
-def tab_charts(data):
-    """Display charts."""
-    st.header("📈 Biểu Đồ")
-    
-    comparison_df = data['comparison']
-    summary_branch = data['summary_branch']
-    summary_cust = data['summary_cust_type']
-    summary_product = data['summary_product']
-    
+    # Overview charts
     col1, col2 = st.columns(2)
     
-    # Chart 1: Growth by branch
     with col1:
-        if not summary_branch.empty:
-            fig = px.bar(
-                summary_branch.sort_values('TONG_DELTA', ascending=False),
-                x='MA_CN',
-                y='TONG_DELTA',
-                title='Tăng Trưởng Theo Chi Nhánh',
-                color='TONG_DELTA',
-                color_continuous_scale=['red', 'yellow', 'green']
+        # Customer change distribution
+        if 'BIEN_DONG' in comparison_df.columns:
+            change_counts = comparison_df['BIEN_DONG'].value_counts()
+            fig_change = px.pie(
+                values=change_counts.values,
+                names=change_counts.index,
+                title='Phân bố biến động khách hàng'
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig_change, use_container_width=True)
     
-    # Chart 2: Customer type comparison
     with col2:
-        if not summary_cust.empty:
-            fig = px.pie(
-                summary_cust,
-                names='CUST_TYPE_NAME',
-                values='TONG_DELTA',
-                title='Tỷ Lệ DELTA Theo Phân Khúc'
+        # Balance distribution
+        if 'TOTAL_T2' in comparison_df.columns:
+            fig_balance = px.histogram(
+                comparison_df,
+                x='TOTAL_T2',
+                nbins=30,
+                title='Phân bố số dư T2',
+                marginal='box'
             )
-            st.plotly_chart(fig, use_container_width=True)
-
-    if not summary_branch.empty:
-        st.subheader('Heatmap tăng trưởng chi nhánh')
-        heatmap_matrix = [summary_branch['TY_LE_TANG_TRUONG'].tolist()]
-        heatmap_labels = summary_branch['MA_CN'].tolist()
-        fig = px.imshow(
-            heatmap_matrix,
-            x=heatmap_labels,
-            y=['Tăng trưởng (%)'],
-            color_continuous_scale='RdYlGn',
-            labels={'x': 'Chi Nhánh', 'y': ''},
-            text_auto='.2f',
-        )
-        fig.update_xaxes(tickangle=45)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Chart 3: Product group
-    col3, col4 = st.columns(2)
-    with col3:
-        if not summary_product.empty:
-            fig = px.bar(
-                summary_product.sort_values('TONG_DELTA', ascending=False),
-                x='DP_GROUP',
-                y=['TONG_T1', 'TONG_T2'],
-                barmode='group',
-                title='So Sánh Theo Nhóm Sản Phẩm'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Chart 4: Change type distribution
-    with col4:
-        change_summary = data['summary_change']
-        if not change_summary.empty:
-            fig = px.bar(
-                change_summary,
-                x='BIEN_DONG',
-                y='SO_KH',
-                title='Phân Bố Biến Động Khách Hàng',
-                color='BIEN_DONG'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-
-def tab_export(data):
-    """Export functionality."""
-    st.header("💾 Xuất Báo Cáo Excel")
-    
-    st.info("""
-    📌 **Tính Năng Xuất Báo Cáo:**
-    - Xuất toàn bộ dữ liệu so sánh sang 7 sheet Excel
-    - Định dạng chuyên nghiệp với header màu
-    - Hỗ trợ công thức và định dạng số tiền
-    """)
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        if st.button("📥 Tải Xuống Excel Báo Cáo Đầy Đủ", use_container_width=True, type="primary"):
-            try:
-                with st.spinner("⏳ Đang chuẩn bị file Excel..."):
-                    excel_data = export_to_excel(
-                        data['comparison'],
-                        data['summary_branch'],
-                        data['summary_cust_type'],
-                        data['summary_product'],
-                        data['outliers'],
-                        data.get('recommendations'),
-                        data.get('driver_analysis'),
-                        data.get('segment_summary'),
-                        data.get('alert_summary')
-                    )
-                    
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"BaoCao_SoSanh_TienGui_{timestamp}.xlsx"
-                    
-                    st.download_button(
-                        label="💾 Tải Xuống",
-                        data=excel_data,
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                    
-                    st.success(f"✅ File sẵn sàng: {filename}")
-            except Exception as e:
-                st.error(f"❌ Lỗi xuất báo cáo: {str(e)}")
+            st.plotly_chart(fig_balance, use_container_width=True)
     
     st.divider()
     
-    # Sheet descriptions
-    st.subheader("📋 Nội Dung Báo Cáo")
-    
-    tabs_info = st.tabs([
-        "📊 Chi Tiết Khách Hàng",
-        "🏢 Theo Chi Nhánh",
-        "👥 Theo Phân Khúc",
-        "🌐 Phân Khúc Nâng Cao",
-        "📦 Theo Sản Phẩm",
-        "⚠️ Bất Thường",
-        "🎯 Khuyến Nghị",
-        "🧭 Động Lực",
-        "🚨 Cảnh Báo"
-    ])
-    
-    with tabs_info[0]:
-        st.markdown("""
-        **Danh sách tất cả khách hàng với:**
-        - Mã khách hàng, tên khách hàng
-        - Dư tiền T1 và T2
-        - Chênh lệch (DELTA)
-        - Loại biến động
+    # Branch analysis charts
+    if not summary_branch.empty:
+        col3, col4 = st.columns(2)
         
-        **Dùng để:** Phân tích chi tiết từng giao dịch
-        """)
-    
-    with tabs_info[1]:
-        st.markdown("""
-        **Thống kê tổng hợp theo chi nhánh:**
-        - Tổng dư T1 và T2
-        - Tổng chênh lệch
-        - Tỷ lệ tăng trưởng (%)
+        with col3:
+            if 'TONG_DELTA' in summary_branch.columns:
+                fig_branch_delta = px.bar(
+                    summary_branch.sort_values('TONG_DELTA', ascending=False).head(15),
+                    x='MA_CN',
+                    y='TONG_DELTA',
+                    title='DELTA theo chi nhánh (Top 15)',
+                    color='TONG_DELTA',
+                    color_continuous_scale='RdYlGn'
+                )
+                st.plotly_chart(fig_branch_delta, use_container_width=True)
         
-        **Dùng để:** So sánh hiệu suất giữa các chi nhánh
-        """)
+        with col4:
+            if 'TY_LE_TANG_TRUONG' in summary_branch.columns:
+                fig_growth = px.bar(
+                    summary_branch.sort_values('TY_LE_TANG_TRUONG', ascending=False).head(15),
+                    x='MA_CN',
+                    y='TY_LE_TANG_TRUONG',
+                    title='Tỷ lệ tăng trưởng (%)',
+                    color='TY_LE_TANG_TRUONG',
+                    color_continuous_scale='RdYlGn'
+                )
+                st.plotly_chart(fig_growth, use_container_width=True)
     
-    with tabs_info[2]:
-        st.markdown("""
-        **Thống kê theo phân khúc khách:**
-        - Cá Nhân vs Pháp Nhân
-        - Số lượng khách hàng
-        - Tổng dư tiền theo phân khúc
+    # Customer segment analysis
+    if 'CUST_TYPE_NAME' in comparison_df.columns:
+        st.subheader('Phân tích theo phân khúc khách hàng')
+        cust_type_summary = comparison_df.groupby('CUST_TYPE_NAME').agg({
+            'DELTA': 'sum',
+            'TOTAL_T2': 'sum',
+            'MA_KH': 'count'
+        }).reset_index()
         
-        **Dùng để:** Phân tích hành vi từng khúc thị trường
-        """)
+        fig_cust_type = px.bar(
+            cust_type_summary.sort_values('DELTA', ascending=False),
+            x='CUST_TYPE_NAME',
+            y='DELTA',
+            title='DELTA theo phân khúc khách hàng',
+            color='DELTA',
+            color_continuous_scale='RdYlGn'
+        )
+        st.plotly_chart(fig_cust_type, use_container_width=True)
+
+
+def tab_export(data: Dict) -> None:
+    """Export comprehensive Excel report."""
+    st.header('📊 Xuất Báo Cáo Excel')
     
-    with tabs_info[3]:
-        st.markdown("""
-        **Phân khúc nâng cao theo dư tiền T2:**
-        - Nhóm khách theo mức tiền gửi
-        - Tổng dư tiền, DELTA, tỷ lệ tăng trưởng
-        - Mức rủi ro trung bình của từng phân khúc
-
-        **Dùng để:** Định hướng chương trình chăm sóc và sản phẩm
-        """)
+    st.markdown('Xuất báo cáo Excel đầy đủ với tất cả dữ liệu phân tích.')
     
-    with tabs_info[4]:
-        st.markdown("""
-        **Thống kê theo loại sản phẩm:**
-        - Từng loại sản phẩm gửi
-        - Tổng dư và chênh lệch
-        - Số khách sử dụng
+    if st.button('📥 Xuất Báo Cáo Đầy Đủ', use_container_width=True, type='primary'):
+        try:
+            from exporter import export_to_excel
+            
+            # Prepare comprehensive export data
+            export_data = {}
+            
+            # Add all available data sections
+            if data.get('comparison') is not None and not data['comparison'].empty:
+                export_data['So sánh khách hàng'] = data['comparison'].copy()
+            
+            if data.get('summary_branch') is not None and not data['summary_branch'].empty:
+                export_data['Tóm tắt chi nhánh'] = data['summary_branch'].copy()
+            
+            if data.get('summary_customer_type') is not None and not data['summary_customer_type'].empty:
+                export_data['Tóm tắt phân khúc KH'] = data['summary_customer_type'].copy()
+            
+            if data.get('summary_product') is not None and not data['summary_product'].empty:
+                export_data['Tóm tắt sản phẩm'] = data['summary_product'].copy()
+            
+            if data.get('segment_summary') is not None and not data['segment_summary'].empty:
+                export_data['Phân tích segment'] = data['segment_summary'].copy()
+            
+            if data.get('recommendations') is not None and not data['recommendations'].empty:
+                export_data['Khuyến nghị'] = data['recommendations'].copy()
+            
+            if data.get('alert_summary') is not None and not data['alert_summary'].empty:
+                export_data['Cảnh báo'] = data['alert_summary'].copy()
+            
+            if data.get('prediction') is not None and not data['prediction'].empty:
+                export_data['Dự báo'] = data['prediction'].copy()
+            
+            if data.get('outliers') is not None and not data['outliers'].empty:
+                export_data['Outliers'] = data['outliers'].copy()
+            
+            if not export_data:
+                st.warning('Không có dữ liệu để xuất.')
+                return
+            
+            # Create Excel export directly
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                for sheet_name, df in export_data.items():
+                    if not df.empty:
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            excel_data = output.getvalue()
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'BaoCao_DayDu_{timestamp}.xlsx'
+            
+            st.download_button(
+                label='💾 Tải xuống báo cáo đầy đủ',
+                data=excel_data,
+                file_name=filename,
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                use_container_width=True
+            )
+            
+            st.success(f'✅ Báo cáo Excel đã sẵn sàng tải xuống: {filename}')
+            
+        except Exception as e:
+            st.error(f'❌ Lỗi xuất báo cáo: {e}')
 
-        **Dùng để:** Đánh giá hiệu suất sản phẩm
-        """)
 
-    with tabs_info[5]:
-        st.markdown("""
-        - Chi tiết khách hàng
-        - Mức biến động
-        
-        **Dùng để:** Phát hiện giao dịch cần kiểm tra
-        """)
+def render_settings_workspace():
+    """Render app settings and history in main area."""
+    st.header('Cài đặt')
+    st.divider()
 
-    with tabs_info[6]:
-        st.markdown("""
-        **Danh sách khuyến nghị hành động:**
-        - Mức ưu tiên (RAT_CAO/CAO/TRUNG_BINH)
-        - Lý do kích hoạt khuyến nghị
-        - Hành động gợi ý cho đội kinh doanh/chăm sóc
-        - Bao gồm ngữ cảnh biến động (T1, T2, DELTA, BIEN_DONG)
+    st.subheader('Lịch sử so sánh')
+    history_df = load_history()
+    if history_df.empty:
+        st.caption('Chưa có lịch sử xử lý.')
+        return
 
-        **Dùng để:** Chuyển số liệu thành danh sách hành động thực thi
-        """)
+    history_df_display = history_df.copy()
+    if 'cache_key' in history_df_display.columns:
+        history_df_display = history_df_display.drop(columns=['cache_key'])
 
-    with tabs_info[7]:
-        st.markdown("""
-        **Phân tích động lực biến động:**
-        - Đóng góp tăng/giảm theo phân khúc khách hàng
-        - Đóng góp tăng/giảm theo nhóm sản phẩm
-        - Tỷ lệ đóng góp ròng và theo trị tuyệt đối
-        - Nhận diện nhóm kéo tăng/kéo giảm mạnh nhất
+    st.dataframe(history_df_display, use_container_width=True, hide_index=True)
 
-        **Dùng để:** Xác định nguyên nhân chính của biến động tổng
-        """)
+    history_labels = []
+    for _, row in history_df.iterrows():
+        total_delta = float(row['total_delta']) if pd.notna(row['total_delta']) else 0
+        label = (
+            f"{row['timestamp']} | T1={row['t1_date']} ({row['t1_files']} file)"
+            f" - T2={row['t2_date']} ({row['t2_files']} file) | KH={row['customers']} | Δ={total_delta:,.0f}"
+        )
+        history_labels.append((label, row['cache_key']))
 
-    with tabs_info[8]:
-        st.markdown("""
-        **Cảnh báo và rủi ro:**
-        - Chi nhánh giảm mạnh cần kiểm soát
-        - Nhóm biến động âm lớn
-        - Số lượng outlier cần rà soát
-        - Khách hàng ưu tiên giữ chân
+    selected_cache_key = st.selectbox(
+        'Chọn lần so sánh để xem lại',
+        [label for label, _ in history_labels],
+        key='selected_history_entry'
+    )
 
-        **Dùng để:** Lập danh sách hành động nhanh và ưu tiên theo rủi ro
-        """)
+    if selected_cache_key:
+        selected_index = [label for label, _ in history_labels].index(selected_cache_key)
+        selected_key = history_labels[selected_index][1]
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if st.button('Xem lại phân tích', key='review_history'):
+                loaded_data = load_processed_data(selected_key)
+                if loaded_data and isinstance(loaded_data, dict):
+                    st.session_state['history_loaded_data'] = loaded_data
+                    st.success('Đã tải lại phân tích từ lịch sử. Chuyển sang trang Phân tích để xem chi tiết.')
+                else:
+                    st.error('Không tìm thấy dữ liệu phân tích cho lần so sánh này. Có thể cache đã bị xóa hoặc bị hỏng.')
+
+        with col2:
+            if st.button('Xem dữ liệu hiện tại', key='clear_history_view'):
+                st.session_state['history_loaded_data'] = None
+                st.success('Đã chuyển về dữ liệu phân tích hiện tại.')
+
+    st.download_button(
+        label='Tải lịch sử CSV',
+        data=history_df.to_csv(index=False).encode('utf-8-sig'),
+        file_name='comparison_history_recent.csv',
+        mime='text/csv',
+    )
+    if st.button('Dọn dẹp cache cũ', help='Xóa cache entries cũ hơn 30 ngày'):
+        cleanup_old_cache(30)
+
+
+def render_sidebar_navigation() -> str:
+    """Render a dashboard-style left navigation and return the active page."""
+    nav_items = [
+        ('Dashboard', 'Tổng quan', 'dashboard.view', 'Tổng hợp nhanh kết quả phân tích'),
+        ('Kho dữ liệu', 'Kho dữ liệu', 'warehouse.view', 'Import, lịch dữ liệu và quản lý file'),
+        ('So sánh dữ liệu', 'So sánh', 'comparison.run', 'Chọn T1/T2 và chạy đối chiếu'),
+        ('Phân tích', 'Phân tích', 'analysis.view', 'Chi tiết, cảnh báo, AI và khuyến nghị'),
+        ('Báo cáo', 'Báo cáo', 'report.view', 'Biểu đồ, Excel và chia sẻ'),
+        ('Cài đặt', 'Cài đặt', 'settings.history', 'Mapping cột, lịch sử và cache'),
+    ]
+    visible_items = nav_items
+
+    if 'main_dashboard_page' not in st.session_state:
+        st.session_state.main_dashboard_page = visible_items[0][0] if visible_items else ''
+
+    if visible_items and st.session_state.main_dashboard_page not in [item[0] for item in visible_items]:
+        st.session_state.main_dashboard_page = visible_items[0][0]
+
+    st.markdown(
+        """
+        <div class="sidebar-brand">
+            <div class="sidebar-brand-title">Thi đua</div>
+            <div class="sidebar-brand-subtitle">Tiền gửi & phân tích</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not visible_items:
+        st.warning('Tài khoản chưa được cấp quyền chức năng nào.')
+        return ''
+
+    for page_key, label, _, help_text in visible_items:
+        is_active = st.session_state.main_dashboard_page == page_key
+        button_type = 'primary' if is_active else 'secondary'
+        if st.button(label, key=f'nav_{page_key}', help=help_text, use_container_width=True, type=button_type):
+            st.session_state.main_dashboard_page = page_key
+            st.rerun()
+
+    return st.session_state.main_dashboard_page
+
+
+def main():
+    """Dashboard-layout application entry point."""
+    init_session_state()
+
+    if st.query_params.get("session"):
+        render_shared_analysis_viewer()
+        return
+
+    with st.sidebar:
+        selected_page = render_sidebar_navigation()
+        st.markdown('---')
+        data_ready = st.session_state.processed_data is not None
+        st.caption(f"Trạng thái: {'Đã có dữ liệu phân tích' if data_ready else 'Chưa chạy so sánh'}")
+
+    st.markdown('<div class="main-header">Hệ Thống So Sánh Dữ Liệu Tiền Gửi</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Dashboard nghiệp vụ theo kho dữ liệu, kỳ so sánh và báo cáo phân tích</div>', unsafe_allow_html=True)
+
+    data = get_active_analysis_data()
+
+    if selected_page == 'Dashboard':
+        if data:
+            render_summary_metrics(data)
+            st.divider()
+            tab_dashboard(data)
+        else:
+            placeholder = st.container(key='info_no_analysis_sidebar')
+            placeholder.info('Chưa có dữ liệu phân tích. Vào Kho dữ liệu để import file, sau đó vào So sánh dữ liệu để chọn T1/T2.')
+    elif selected_page == 'Kho dữ liệu':
+        render_warehouse_workspace()
+    elif selected_page == 'So sánh dữ liệu':
+        render_compare_workspace()
+    elif selected_page == 'Phân tích':
+        render_analysis_workspace(data)
+    elif selected_page == 'Báo cáo':
+        render_report_workspace(data)
+    elif selected_page == 'Cài đặt':
+        render_settings_workspace()
 
 
 if __name__ == "__main__":

@@ -130,7 +130,7 @@ Máy Không Internet:
 ☐ Extract .zip
 ☐ Chạy setup_offline.bat/sh
 ☐ Chạy streamlit run app.py
-☐ Truy cập http://localhost:8501
+☐ Truy cập http://pip install dask==2023.12.1 scikit-learn==1.3.0:8501
 ```
 
 ---
